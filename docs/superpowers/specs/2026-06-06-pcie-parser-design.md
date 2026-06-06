@@ -1,7 +1,7 @@
 # PCIe Base Spec Parser Design
 
 Date: 2026-06-06
-Status: Approved design, awaiting implementation plan
+Status: Approved design, revised after external review, awaiting implementation plan
 
 ## Scope
 
@@ -32,6 +32,9 @@ not be ingested by LLM Wiki directly.
 - Do not perform corpus-wide object deduplication in the first version.
 - Do not OCR equations or produce LaTeX in the first version.
 - Do not build embedding rerank or semantic retrieval in this parser phase.
+- Do not generate a semantic version-diff corpus in the first version. The
+  `base-7.0-vs-6.4` output is a parsed form of the official comparison PDF, not
+  a parser-created section/object diff.
 
 ## Output Layout
 
@@ -61,7 +64,9 @@ raw/sources/parsed/
 ```
 
 `base-7.0`, `base-6.4`, and `base-7.0-vs-6.4` are version boundaries and object
-canonicalization boundaries.
+canonicalization boundaries. `base-7.0-vs-6.4` represents the official
+comparison PDF (`CB-PCI_Express_Base_7.0-vs-6.4.pdf`) parsed as its own source
+corpus. It does not require a `diff` manifest record type in v0.1.
 
 ## Section Contract
 
@@ -80,6 +85,21 @@ Section Markdown contains:
 Section Markdown must not contain internal figure, table, or equation content.
 Text spans inside registered object bounding boxes are subtracted before
 section rendering.
+
+Object placeholders and bbox subtraction follow these rules:
+
+- Inline prose references such as "see Figure 4-72" remain in section text.
+- Actual object occurrence locations get one placeholder link to the canonical
+  object file.
+- Figure/table/equation captions belong to the object, not to the section body.
+- Table notes and figure footnotes belong to the object when they are adjacent
+  to the object bbox and visually tied to the caption or object body.
+- Bbox subtraction uses an object bbox expanded by a configurable caption and
+  note margin. The default expansion is 36 pt vertically and 6 pt horizontally.
+  The expansion may include captions and notes, but must not consume normal
+  paragraphs that merely contain inline references.
+- If a bbox overlaps unexpected section text, the object registry still wins:
+  subtract the object spans from section text and emit a `parse_warning`.
 
 Example section frontmatter:
 
@@ -136,6 +156,16 @@ an object Markdown wrapper plus `html` and `json` assets when extraction
 succeeds. If structured JSON cannot be produced, the parser keeps the HTML or a
 screenshot fallback and writes a parse warning.
 
+Object number extraction is deterministic:
+
+- Figure numbers match `Figure <chapter>-<number>` or `Fig. <chapter>-<number>`.
+- Table numbers match `Table <chapter>-<number>`.
+- Equation numbers come from the List of Equations when present. If a listed
+  equation has no explicit visible number, the parser assigns a stable
+  section-local object number such as `4.2.6-e0001`.
+- The original caption/title text is preserved in frontmatter even when the
+  filename slug is normalized.
+
 Example object frontmatter:
 
 ```yaml
@@ -185,6 +215,35 @@ Object records include `object_type`, `object_number`, `title`, `path`, `assets`
 `severity`, `code`, `message`, and the related `page`, `section_id`, or
 `object_id`.
 
+Table JSON uses this minimum schema. It must preserve merged cells and source
+locations; consumers should treat it as structured extraction output rather
+than a normalized relational table:
+
+```json
+{
+  "schema_version": "pcie-table-json-0.1",
+  "table_id": "base-7.0:table:4-14",
+  "caption": "L0s Timing Parameters",
+  "page_start": 515,
+  "page_end": 516,
+  "bbox": [72.0, 160.0, 540.0, 620.0],
+  "headers": [
+    [
+      {"text": "Parameter", "rowspan": 1, "colspan": 1, "page": 515, "bbox": [72.0, 160.0, 160.0, 180.0], "hash": "sha256:example"}
+    ]
+  ],
+  "rows": [
+    [
+      {"text": "tCOH", "rowspan": 1, "colspan": 1, "page": 515, "bbox": [72.0, 182.0, 160.0, 202.0], "hash": "sha256:example"}
+    ]
+  ],
+  "notes": [
+    {"text": "Note 1: example", "page": 516, "bbox": [72.0, 600.0, 540.0, 620.0], "hash": "sha256:example"}
+  ],
+  "source_html": "table-4-14-l0s-timing-parameters.html"
+}
+```
+
 ## Parser Pipeline
 
 1. Discover documents from configured PDF paths and version mappings. Compute
@@ -194,8 +253,13 @@ Object records include `object_type`, `object_number`, `title`, `path`, `assets`
    version-local object seed registry.
 4. Extract layout spans, bboxes, images, drawings, and table-like regions with
    PyMuPDF.
-5. Localize objects on or near their listed pages. Do not perform unrestricted
-   whole-document guessing.
+5. Localize objects using the object registry:
+   - Search the listed page first.
+   - If not found, search `listed_page - 2` through `listed_page + 2`.
+   - If still not found, search only the page range of the section associated
+     with the object list entry or nearest outline context.
+   - If still not found, emit an unresolved-object warning and do not perform
+     unrestricted whole-document guessing.
 6. Render object assets and object Markdown wrappers.
 7. Render section Markdown after subtracting registered object bboxes from the
    section text span set.
@@ -218,6 +282,7 @@ Recoverable warnings:
 - An object spans multiple pages and cannot be merged cleanly.
 - A slug collision requires a stable hash suffix.
 - An object bbox overlaps an unexpected section range.
+- An object is listed on one page but localized on a nearby fallback page.
 
 Recoverable warnings are emitted as `parse_warning` manifest records. The parser
 should keep producing the rest of the corpus.
@@ -231,19 +296,36 @@ should keep producing the rest of the corpus.
   bytes.
 - Manifest output order is deterministic: document records, sections by outline
   order, objects by type and number, assets, warnings.
-- The parser writes to a temporary output directory and atomically replaces the
-  version output only after a successful run.
+- The parser writes to a temporary output directory and replaces the version
+  output only after a successful run. On Windows, directory replacement should
+  be implemented as a guarded swap with backup cleanup because `os.replace`
+  cannot atomically replace a non-empty directory in the same way on every
+  platform.
 - The parser does not read network resources and does not invoke LLMs.
 
 ## LLM Wiki Integration
 
-LLM Wiki should ingest parsed Markdown, not the PDFs. Recommended Source Watch
-settings for this project:
+LLM Wiki should ingest parsed Markdown, not the PDFs. Parser frontmatter types
+such as `pcie_section` and `pcie_object` describe raw-source records. They do
+not have to match generated wiki page types directly.
 
-- Include Markdown and structured text assets needed by wrappers.
-- Exclude PDF and image binaries from automatic ingest.
+Before ingesting parsed PCIe sources, update the PCIe project `purpose.md` and
+`schema.md` away from the current reading-template language. The schema should
+tell LLM Wiki that raw sources may be `pcie_section` and `pcie_object` records,
+and that generated wiki pages should be protocol-analysis pages such as
+concepts, mechanisms, packet formats, state machines, registers, fields,
+queries, and comparisons.
+
+Recommended Source Watch settings for this project:
+
+- Include only Markdown wrapper files for automatic ingest.
+- Exclude PDF, PNG, HTML, and JSON assets from automatic ingest.
 - Keep original PDFs in `raw/originals/`.
 - Keep parsed Markdown under `raw/sources/parsed/<version>/`.
+
+Agents and future tooling can read table HTML/JSON and screenshots directly by
+following links from object Markdown or `manifest.jsonl`. LLM Wiki should not
+ingest those assets as standalone source files.
 
 Before enabling this parser workflow, cancel or clear existing PDF ingest tasks
 for the PCIe project so the default PDF pipeline does not generate competing
@@ -277,6 +359,15 @@ Spot-check object text subtraction:
 ```powershell
 rg -n "L0s Substate Machine|Figure 4-72" D:\LLMWiki\PCIe-base-spec\PCIe-base-spec\raw\sources\parsed\base-7.0\sections
 rg -n "L0s Substate Machine" D:\LLMWiki\PCIe-base-spec\PCIe-base-spec\raw\sources\parsed\base-7.0\objects
+```
+
+If `rg` is unavailable, use PowerShell:
+
+```powershell
+Get-ChildItem D:\LLMWiki\PCIe-base-spec\PCIe-base-spec\raw\sources\parsed\base-7.0\sections -Recurse -File |
+  Select-String -Pattern "L0s Substate Machine|Figure 4-72"
+Get-ChildItem D:\LLMWiki\PCIe-base-spec\PCIe-base-spec\raw\sources\parsed\base-7.0\objects -Recurse -File |
+  Select-String -Pattern "L0s Substate Machine"
 ```
 
 Expected result: section files contain only placeholder or link text for the

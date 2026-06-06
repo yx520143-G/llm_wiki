@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Sequence
 
 from pcie_parser.manifest import Manifest, object_record, section_record, warning_record
-from pcie_parser.models import BBox, ParseWarning, SectionNode, SourceObject, TextSpan
+from pcie_parser.models import BBox, ObjectRef, ParseWarning, SectionNode, SourceObject, TextSpan
 from pcie_parser.objects import extract_object_seeds_from_list_spans, localize_object_from_spans
 from pcie_parser.pdf_backend import (
     PdfAssetExtractor,
@@ -19,7 +19,7 @@ from pcie_parser.pdf_backend import (
     table_rows_have_real_content,
     write_table_html,
 )
-from pcie_parser.render import render_object_markdown, render_section_markdown
+from pcie_parser.render import render_object_markdown, render_section_markdown, spans_to_section_body
 from pcie_parser.slug import content_hash, section_slug
 from pcie_parser.writer import assert_inside_project, replace_output_dir
 
@@ -96,13 +96,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         for subdir in OBJECT_SUBDIRS.values():
             (objects_root / subdir).mkdir(parents=True, exist_ok=True)
 
-        _write_objects_and_assets(staged, pdf_path, spans, objects, object_warnings, manifest)
+        object_path_by_id = _write_objects_and_assets(staged, pdf_path, spans, objects, object_warnings, manifest)
 
         seen_slugs: dict[str, str] = {}
 
         for section in sections:
-            section.body_markdown = ""
-            section.content_hash = content_hash(section.body_markdown)
             section.slug = section_slug(section.section_number, section.title)
             previous_section_id = seen_slugs.get(section.slug)
             if previous_section_id is not None:
@@ -111,6 +109,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{previous_section_id!r} and {section.section_id!r}"
                 )
             seen_slugs[section.slug] = section.section_id
+            section_spans = [span for span in spans if section.page_start <= span.page <= section.page_end]
+            section_objects = [obj for obj in objects if obj.section_id == section.section_id]
+            section.object_refs = [
+                ObjectRef(
+                    object_id=obj.object_id,
+                    path=relative_object_path_from_section(object_path_by_id[obj.object_id]),
+                    occurrence="actual",
+                )
+                for obj in section_objects
+                if obj.object_id in object_path_by_id
+            ]
+            section.body_markdown = spans_to_section_body(section_spans, section_objects)
+            section.content_hash = content_hash(section.body_markdown)
 
             relative_path = Path("sections") / f"{section.slug}.md"
             output_path = staged / relative_path
@@ -213,9 +224,10 @@ def _write_objects_and_assets(
     objects: list[SourceObject],
     warnings: list[ParseWarning],
     manifest: Manifest,
-) -> None:
+) -> dict[str, str]:
     seen_ids: set[str] = set()
     seen_paths: set[str] = set()
+    object_path_by_id: dict[str, str] = {}
     asset_extractor: PdfAssetExtractor | None = None
 
     try:
@@ -227,6 +239,7 @@ def _write_objects_and_assets(
             subdir = OBJECT_SUBDIRS[obj.object_type]
             object_relative_path = Path("objects") / subdir / f"{obj.slug}.md"
             _ensure_unique_output_path(object_relative_path, seen_paths, "object")
+            object_path_by_id[obj.object_id] = object_relative_path.as_posix()
 
             caption_bbox = _caption_bbox_for_object(obj, spans)
             if obj.object_type in {"figure", "equation"}:
@@ -290,6 +303,11 @@ def _write_objects_and_assets(
 
     for warning in warnings:
         manifest.add(warning_record(warning))
+    return object_path_by_id
+
+
+def relative_object_path_from_section(object_path: str) -> str:
+    return "../" + Path(object_path).as_posix().replace("\\", "/")
 
 
 def _caption_bbox_for_object(obj: SourceObject, spans: list[TextSpan]) -> BBox | None:

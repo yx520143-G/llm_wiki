@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+from numbers import Real
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -9,39 +11,76 @@ from pcie_parser.models import BBox, SectionNode, TextSpan
 
 OutlineEntry = tuple[int, str, int]
 
-_SECTION_PREFIX_RE = re.compile(r"^\s*(?:Chapter\s+)?(?P<number>\d+(?:\.\d+)*)(?:[\s.:;-]+|$)", re.IGNORECASE)
+_NUMERIC_SECTION_RE = r"\d+(?:\.\d+)*"
+_APPENDIX_SECTION_RE = r"(?:[A-Za-z]|\d+)(?:\.\d+)*"
+_SECTION_SEPARATOR_RE = r"(?:[\s.:;-]+|$)"
+_SECTION_PREFIX_RES = (
+    (
+        "section",
+        re.compile(rf"^\s*Section\s+(?P<number>{_NUMERIC_SECTION_RE}){_SECTION_SEPARATOR_RE}", re.IGNORECASE),
+    ),
+    (
+        "chapter",
+        re.compile(rf"^\s*Chapter\s+(?P<number>{_NUMERIC_SECTION_RE}){_SECTION_SEPARATOR_RE}", re.IGNORECASE),
+    ),
+    (
+        "appendix",
+        re.compile(rf"^\s*Appendix\s+(?P<number>{_APPENDIX_SECTION_RE}){_SECTION_SEPARATOR_RE}", re.IGNORECASE),
+    ),
+    (
+        "bare",
+        re.compile(rf"^\s*(?P<number>{_NUMERIC_SECTION_RE}){_SECTION_SEPARATOR_RE}", re.IGNORECASE),
+    ),
+)
+
+
+def _parse_section_prefix(title: str) -> tuple[str, str] | None:
+    for prefix_kind, pattern in _SECTION_PREFIX_RES:
+        match = pattern.match(title)
+        if match is None:
+            continue
+        section_number = match.group("number")
+        if prefix_kind == "appendix" and section_number[:1].isalpha():
+            section_number = f"{section_number[0].upper()}{section_number[1:]}"
+        return section_number, title[match.end() :].strip()
+    return None
 
 
 def extract_section_number(title: str) -> str | None:
-    match = _SECTION_PREFIX_RE.match(title)
-    if match is None:
+    parsed = _parse_section_prefix(title)
+    if parsed is None:
         return None
-    return match.group("number")
+    return parsed[0]
 
 
 def strip_section_number(title: str) -> str:
-    match = _SECTION_PREFIX_RE.match(title)
-    if match is None:
+    parsed = _parse_section_prefix(title)
+    if parsed is None:
         return title.strip()
-    return title[match.end() :].strip()
+    return parsed[1]
 
 
 def outline_entries_to_sections(spec_version: str, entries: Iterable[OutlineEntry], page_count: int) -> list[SectionNode]:
     numbered_entries: list[tuple[int, str, int, str, str]] = []
     for level, title, page in entries:
-        section_number = extract_section_number(title)
-        if section_number is None:
+        raw_title = str(title)
+        parsed = _parse_section_prefix(raw_title)
+        if parsed is None:
             continue
-        numbered_entries.append((int(level), str(title), int(page), section_number, strip_section_number(title)))
+        section_number, stripped_title = parsed
+        numbered_entries.append((int(level), raw_title, int(page), section_number, stripped_title))
 
     sections: list[SectionNode] = []
     level_stack: dict[int, SectionNode] = {}
 
     for index, (level, _title, page_start, section_number, stripped_title) in enumerate(numbered_entries):
-        if index + 1 < len(numbered_entries):
-            page_end = max(page_start, numbered_entries[index + 1][2] - 1)
-        else:
-            page_end = page_count
+        page_end = page_count
+        for next_level, _next_title, next_page_start, _next_section_number, _next_stripped_title in numbered_entries[
+            index + 1 :
+        ]:
+            if next_level <= level:
+                page_end = max(page_start, next_page_start - 1)
+                break
 
         stale_levels = [stack_level for stack_level in level_stack if stack_level >= level]
         for stack_level in stale_levels:
@@ -73,11 +112,37 @@ def outline_entries_to_sections(spec_version: str, entries: Iterable[OutlineEntr
     return sections
 
 
+def _validate_bbox(bbox: Sequence[float]) -> tuple[float, float, float, float]:
+    try:
+        values = list(bbox)
+    except TypeError as exc:
+        raise ValueError("bbox must be a sequence of exactly 4 finite numeric values") from exc
+
+    if len(values) != 4:
+        raise ValueError(f"bbox must contain exactly 4 values; got {len(values)}")
+
+    coords: list[float] = []
+    for index, value in enumerate(values):
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError(f"bbox[{index}] must be numeric; got {type(value).__name__}")
+        coord = float(value)
+        if not math.isfinite(coord):
+            raise ValueError(f"bbox[{index}] must be finite; got {value!r}")
+        coords.append(coord)
+
+    x0, y0, x1, y1 = coords
+    if x1 < x0 or y1 < y0:
+        raise ValueError(f"bbox coordinates must not be reversed; got {coords!r}")
+
+    return x0, y0, x1, y1
+
+
 def span_dict_to_text_span(text: str, page: int, bbox: Sequence[float], block: int, line: int, span: int) -> TextSpan:
+    x0, y0, x1, y1 = _validate_bbox(bbox)
     return TextSpan(
         text=text,
         page=page,
-        bbox=BBox(float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+        bbox=BBox(x0, y0, x1, y1),
         block=block,
         line=line,
         span=span,
@@ -107,11 +172,18 @@ class PdfBackend:
             spans: list[TextSpan] = []
             for page_index in range(doc.page_count):
                 page = doc.load_page(page_index)
-                page_dict = page.get_text("dict")
+                try:
+                    # sort=True keeps downstream body/hash output deterministic when PyMuPDF supports it.
+                    page_dict = page.get_text("dict", sort=True)
+                except TypeError:
+                    page_dict = page.get_text("dict")
                 for block_index, block in enumerate(page_dict.get("blocks", [])):
                     for line_index, line in enumerate(block.get("lines", [])):
                         for span_index, span in enumerate(line.get("spans", [])):
-                            text = str(span.get("text", "")).strip()
+                            raw_text = span.get("text", "")
+                            if raw_text is None:
+                                continue
+                            text = str(raw_text).strip()
                             if not text:
                                 continue
                             spans.append(

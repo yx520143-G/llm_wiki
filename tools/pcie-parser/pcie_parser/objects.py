@@ -6,7 +6,14 @@ from typing import Any
 from pcie_parser.models import SourceObject, TableCell
 
 
-OBJECT_HEADING_RE = re.compile(r"^(Figure|Fig\.|Table|Equation)\s+([0-9]+[-.][0-9A-Za-z.]+)\s+(.+)$", re.IGNORECASE)
+OBJECT_HEADING_RE = re.compile(
+    r"^(Figure|Fig\.|Table|Equation)\s+"
+    r"\(?([0-9]+(?:[-.][0-9]+[A-Za-z]?)+)\)?"
+    r"(?:\s*[:.]|\s+)"
+    r"(.+)$",
+    re.IGNORECASE,
+)
+DOTTED_LEADER_PAGE_RE = re.compile(r"\s*(?:\. ?){3,}\s*[0-9]+\s*$")
 
 
 def parse_object_heading(text: str) -> tuple[str, str, str] | None:
@@ -17,18 +24,25 @@ def parse_object_heading(text: str) -> tuple[str, str, str] | None:
     kind, number, title = match.groups()
     lowered = kind.lower()
     object_type = "figure" if lowered in {"figure", "fig."} else lowered
-    return object_type, number, title.strip()
+    cleaned_title = DOTTED_LEADER_PAGE_RE.sub("", title).strip()
+    return object_type, number, cleaned_title
 
 
 def fallback_pages(listed_page: int, section_start: int | None, section_end: int | None) -> list[int]:
-    pages: list[int] = [listed_page]
-    for page in range(listed_page - 2, listed_page + 3):
-        if page > 0 and page not in pages:
+    pages: list[int] = []
+    seen: set[int] = set()
+
+    def add_page(page: int) -> None:
+        if page > 0 and page not in seen:
             pages.append(page)
+            seen.add(page)
+
+    add_page(listed_page)
+    for page in range(listed_page - 2, listed_page + 3):
+        add_page(page)
     if section_start is not None and section_end is not None:
         for page in range(section_start, section_end + 1):
-            if page > 0 and page not in pages:
-                pages.append(page)
+            add_page(page)
     return pages
 
 

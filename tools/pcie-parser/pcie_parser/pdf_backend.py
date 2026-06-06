@@ -175,6 +175,37 @@ def crop_bbox_to_png(pdf_path: Path, page_number: int, bbox: BBox, output_path: 
         doc.close()
 
 
+def infer_graphic_bbox_near_caption(
+    pdf_path: Path,
+    page_number: int,
+    caption_bbox: BBox,
+    object_type: str,
+) -> BBox | None:
+    with PdfAssetExtractor(pdf_path) as extractor:
+        return extractor.infer_graphic_bbox_near_caption(page_number, caption_bbox, object_type)
+
+
+def extract_table_rows_near_caption(
+    pdf_path: Path,
+    page_number: int,
+    caption_bbox: BBox,
+) -> tuple[BBox, list[list[str]]] | None:
+    with PdfAssetExtractor(pdf_path) as extractor:
+        return extractor.extract_table_rows_near_caption(page_number, caption_bbox)
+
+
+def table_rows_have_real_content(rows: Sequence[Sequence[object]], caption: str) -> bool:
+    normalized_caption = _normalize_cell_text(caption).lower()
+    non_empty = [_normalize_cell_text(cell) for row in rows for cell in row if _normalize_cell_text(cell)]
+    if not non_empty:
+        return False
+    if len(non_empty) == 1 and non_empty[0].lower() == normalized_caption:
+        return False
+    if normalized_caption and all(cell.lower() == normalized_caption for cell in non_empty):
+        return False
+    return len(non_empty) >= 2 or len(rows) >= 2
+
+
 def write_table_html(path: Path, caption: str, rows: list[list[str]]) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -196,6 +227,343 @@ def write_table_html(path: Path, caption: str, rows: list[list[str]]) -> None:
         lines.append("  </tr>")
     lines.extend(["</table>", "</body>", "</html>"])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+
+
+def _infer_figure_bbox_from_entries(
+    page_rect: object,
+    drawing_bboxes: Sequence[BBox],
+    text_entries: Sequence[tuple[str, BBox]],
+    caption_bbox: BBox,
+) -> BBox | None:
+    candidates = [bbox for bbox in drawing_bboxes if _is_usable_drawing_rect(bbox, page_rect)]
+    above_caption = [
+        bbox
+        for bbox in candidates
+        if bbox.y1 <= caption_bbox.y0 + 12.0 and caption_bbox.y0 - bbox.y1 <= 520.0
+    ]
+    if not above_caption:
+        return None
+
+    seed = min(
+        above_caption,
+        key=lambda bbox: (caption_bbox.y0 - bbox.y1, abs(_center_x(bbox) - _center_x(caption_bbox))),
+    )
+    selected = [seed]
+    changed = True
+    while changed:
+        changed = False
+        current = _union_bboxes(selected)
+        for bbox in above_caption:
+            if bbox in selected:
+                continue
+            if _rects_related(current, bbox, max_gap=90.0):
+                selected.append(bbox)
+                changed = True
+
+    content_bbox = _union_bboxes(selected)
+    text_bboxes = [
+        text_bbox
+        for text, text_bbox in text_entries
+        if text
+        and text_bbox.y1 <= caption_bbox.y0 + 12.0
+        and text_bbox.y0 >= content_bbox.y0 - 24.0
+        and text_bbox.y1 <= content_bbox.y1 + 36.0
+        and _horizontal_overlap_or_near(content_bbox, text_bbox, max_gap=36.0)
+    ]
+    if text_bboxes:
+        content_bbox = _union_bboxes([content_bbox, *text_bboxes])
+
+    return _expand_and_clip_bbox(_union_bboxes([content_bbox, caption_bbox]), page_rect, padding=4.0)
+
+
+def _infer_equation_bbox_from_entries(
+    page_rect: object,
+    drawing_bboxes: Sequence[BBox],
+    line_entries: Sequence[tuple[str, BBox]],
+    caption_bbox: BBox,
+) -> BBox | None:
+    candidate_lines = [
+        (line_text, line_bbox)
+        for line_text, line_bbox in line_entries
+        if line_bbox.y1 <= caption_bbox.y0 + 4.0 and 0.0 <= caption_bbox.y0 - line_bbox.y1 <= 120.0
+    ]
+    equation_lines = [
+        (line_text, line_bbox)
+        for line_text, line_bbox in candidate_lines
+        if _looks_like_equation_text(line_text)
+    ]
+    if not equation_lines:
+        return None
+
+    _seed_text, seed_bbox = min(equation_lines, key=lambda item: caption_bbox.y0 - item[1].y1)
+    selected = [seed_bbox]
+    changed = True
+    while changed:
+        changed = False
+        current = _union_bboxes(selected)
+        for line_text, line_bbox in equation_lines:
+            if line_bbox in selected:
+                continue
+            if _vertical_distance(current, line_bbox) <= 24.0:
+                selected.append(line_bbox)
+                changed = True
+
+    usable_drawing_bboxes = [bbox for bbox in drawing_bboxes if _is_usable_drawing_rect(bbox, page_rect)]
+    current = _union_bboxes(selected)
+    selected.extend(
+        bbox
+        for bbox in usable_drawing_bboxes
+        if _vertical_distance(current, bbox) <= 24.0 and _horizontal_overlap_or_near(current, bbox, max_gap=48.0)
+    )
+    return _expand_and_clip_bbox(_union_bboxes([*selected, caption_bbox]), page_rect, padding=4.0)
+
+
+def _nearest_table_from_entries(
+    table_entries: Sequence[tuple[BBox, list[list[str]]]],
+    caption_bbox: BBox,
+) -> tuple[BBox, list[list[str]]] | None:
+    candidates: list[tuple[float, BBox, list[list[str]]]] = []
+    for table_bbox, rows in table_entries:
+        if not table_rows_have_real_content(rows, caption=""):
+            continue
+
+        distance = _vertical_distance(caption_bbox, table_bbox)
+        if distance > 180.0:
+            continue
+        candidates.append((distance, table_bbox, rows))
+
+    if not candidates:
+        return None
+
+    _distance, table_bbox, rows = min(candidates, key=lambda item: (item[0], item[1].y0, item[1].x0))
+    return table_bbox, rows
+
+
+def _table_entries_for_page(page) -> list[tuple[BBox, list[list[str]]]]:
+    find_tables = getattr(page, "find_tables", None)
+    if find_tables is None:
+        return []
+
+    try:
+        table_finder = find_tables()
+    except Exception:
+        return []
+
+    entries: list[tuple[BBox, list[list[str]]]] = []
+    for table in getattr(table_finder, "tables", []):
+        table_bbox = _bbox_from_rect(table.bbox)
+        rows = _normalize_table_rows(table.extract())
+        if table_rows_have_real_content(rows, caption=""):
+            entries.append((table_bbox, rows))
+    return entries
+
+
+def _drawing_bboxes_for_page(page) -> list[BBox]:
+    return [_bbox_from_rect(drawing["rect"]) for drawing in page.get_drawings() if "rect" in drawing]
+
+
+def _page_text_entries(page) -> list[tuple[str, BBox]]:
+    entries: list[tuple[str, BBox]] = []
+    try:
+        page_dict = page.get_text("dict", sort=True)
+    except TypeError:
+        page_dict = page.get_text("dict")
+    for block in page_dict.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = str(span.get("text") or "").strip()
+                if text:
+                    entries.append((text, _bbox_from_rect(span["bbox"])))
+    return entries
+
+
+def _page_text_line_entries(page) -> list[tuple[str, BBox]]:
+    entries: list[tuple[str, BBox]] = []
+    try:
+        page_dict = page.get_text("dict", sort=True)
+    except TypeError:
+        page_dict = page.get_text("dict")
+    for block in page_dict.get("blocks", []):
+        for line in block.get("lines", []):
+            line_spans: list[tuple[str, BBox]] = []
+            for span in line.get("spans", []):
+                text = str(span.get("text") or "").strip()
+                if text:
+                    line_spans.append((text, _bbox_from_rect(span["bbox"])))
+            if line_spans:
+                entries.append(
+                    (
+                        " ".join(text for text, _bbox in line_spans),
+                        _union_bboxes([bbox for _text, bbox in line_spans]),
+                    )
+                )
+    return entries
+
+
+def _normalize_table_rows(rows: object) -> list[list[str]]:
+    if rows is None:
+        return []
+    normalized_rows: list[list[str]] = []
+    for row in rows:
+        normalized_rows.append([_normalize_cell_text(cell) for cell in row])
+    return normalized_rows
+
+
+def _normalize_cell_text(cell: object) -> str:
+    if cell is None:
+        return ""
+    return " ".join(str(cell).strip().split())
+
+
+def _looks_like_equation_text(text: str) -> bool:
+    normalized = " ".join(text.strip().split())
+    if not normalized:
+        return False
+    if "=" in normalized:
+        return True
+    if re.search(r"[+\-*/÷×≤≥<>∑√]|_[A-Za-z0-9]", normalized) is not None:
+        return True
+    return bool(re.fullmatch(r"[A-Z][A-Z0-9_ ()]+", normalized) and "_" in normalized)
+
+
+def _bbox_from_rect(rect: object) -> BBox:
+    x0, y0, x1, y1 = [float(value) for value in rect]
+    return BBox(x0, y0, x1, y1)
+
+
+def _union_bboxes(bboxes: Sequence[BBox]) -> BBox:
+    if not bboxes:
+        raise ValueError("cannot union an empty bbox sequence")
+    return BBox(
+        min(bbox.x0 for bbox in bboxes),
+        min(bbox.y0 for bbox in bboxes),
+        max(bbox.x1 for bbox in bboxes),
+        max(bbox.y1 for bbox in bboxes),
+    )
+
+
+def _expand_and_clip_bbox(bbox: BBox, page_rect: object, padding: float) -> BBox:
+    return BBox(
+        max(float(page_rect.x0), bbox.x0 - padding),
+        max(float(page_rect.y0), bbox.y0 - padding),
+        min(float(page_rect.x1), bbox.x1 + padding),
+        min(float(page_rect.y1), bbox.y1 + padding),
+    )
+
+
+def _is_usable_drawing_rect(bbox: BBox, page_rect: object) -> bool:
+    width = bbox.x1 - bbox.x0
+    height = bbox.y1 - bbox.y0
+    page_width = float(page_rect.width)
+    page_height = float(page_rect.height)
+    if width <= 1.0 or height <= 1.0:
+        return False
+    if width >= page_width * 0.95 and height >= page_height * 0.90:
+        return False
+    if bbox.y0 < float(page_rect.y0) + 24.0 or bbox.y1 > float(page_rect.y1) - 24.0:
+        return False
+    return True
+
+
+def _center_x(bbox: BBox) -> float:
+    return (bbox.x0 + bbox.x1) / 2.0
+
+
+def _vertical_distance(a: BBox, b: BBox) -> float:
+    if a.y1 < b.y0:
+        return b.y0 - a.y1
+    if b.y1 < a.y0:
+        return a.y0 - b.y1
+    return 0.0
+
+
+def _horizontal_overlap_or_near(a: BBox, b: BBox, max_gap: float) -> bool:
+    if min(a.x1, b.x1) >= max(a.x0, b.x0):
+        return True
+    return min(abs(a.x1 - b.x0), abs(b.x1 - a.x0)) <= max_gap
+
+
+def _rects_related(a: BBox, b: BBox, max_gap: float) -> bool:
+    return _vertical_distance(a, b) <= max_gap and _horizontal_overlap_or_near(a, b, max_gap=max_gap)
+
+
+class PdfAssetExtractor:
+    def __init__(self, pdf_path: Path):
+        import fitz
+
+        self.doc = fitz.open(pdf_path)
+        self._pages: dict[int, object] = {}
+        self._drawing_bboxes: dict[int, list[BBox]] = {}
+        self._text_entries: dict[int, list[tuple[str, BBox]]] = {}
+        self._text_line_entries: dict[int, list[tuple[str, BBox]]] = {}
+        self._table_entries: dict[int, list[tuple[BBox, list[list[str]]]]] = {}
+
+    def __enter__(self) -> "PdfAssetExtractor":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self.doc.close()
+
+    def infer_graphic_bbox_near_caption(
+        self,
+        page_number: int,
+        caption_bbox: BBox,
+        object_type: str,
+    ) -> BBox | None:
+        page = self._page(page_number)
+        if object_type == "equation":
+            return _infer_equation_bbox_from_entries(
+                page.rect,
+                self._drawing_bboxes_for_page(page_number),
+                self._text_line_entries_for_page(page_number),
+                caption_bbox,
+            )
+        if object_type == "figure":
+            return _infer_figure_bbox_from_entries(
+                page.rect,
+                self._drawing_bboxes_for_page(page_number),
+                self._text_entries_for_page(page_number),
+                caption_bbox,
+            )
+        return None
+
+    def extract_table_rows_near_caption(
+        self,
+        page_number: int,
+        caption_bbox: BBox,
+    ) -> tuple[BBox, list[list[str]]] | None:
+        self._page(page_number)
+        return _nearest_table_from_entries(self._table_entries_for_page(page_number), caption_bbox)
+
+    def _page(self, page_number: int):
+        if page_number < 1 or page_number > self.doc.page_count:
+            raise ValueError(f"page_number {page_number} is outside PDF page range 1..{self.doc.page_count}")
+        if page_number not in self._pages:
+            self._pages[page_number] = self.doc.load_page(page_number - 1)
+        return self._pages[page_number]
+
+    def _drawing_bboxes_for_page(self, page_number: int) -> list[BBox]:
+        if page_number not in self._drawing_bboxes:
+            self._drawing_bboxes[page_number] = _drawing_bboxes_for_page(self._page(page_number))
+        return self._drawing_bboxes[page_number]
+
+    def _text_entries_for_page(self, page_number: int) -> list[tuple[str, BBox]]:
+        if page_number not in self._text_entries:
+            self._text_entries[page_number] = _page_text_entries(self._page(page_number))
+        return self._text_entries[page_number]
+
+    def _text_line_entries_for_page(self, page_number: int) -> list[tuple[str, BBox]]:
+        if page_number not in self._text_line_entries:
+            self._text_line_entries[page_number] = _page_text_line_entries(self._page(page_number))
+        return self._text_line_entries[page_number]
+
+    def _table_entries_for_page(self, page_number: int) -> list[tuple[BBox, list[list[str]]]]:
+        if page_number not in self._table_entries:
+            self._table_entries[page_number] = _table_entries_for_page(self._page(page_number))
+        return self._table_entries[page_number]
 
 
 class PdfBackend:

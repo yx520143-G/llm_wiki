@@ -9,9 +9,16 @@ from pathlib import Path
 from typing import Sequence
 
 from pcie_parser.manifest import Manifest, object_record, section_record, warning_record
-from pcie_parser.models import ParseWarning, SectionNode, SourceObject, TextSpan
+from pcie_parser.models import BBox, ParseWarning, SectionNode, SourceObject, TextSpan
 from pcie_parser.objects import extract_object_seeds_from_list_spans, localize_object_from_spans
-from pcie_parser.pdf_backend import PdfBackend, crop_bbox_to_png, outline_entries_to_sections, write_table_html
+from pcie_parser.pdf_backend import (
+    PdfAssetExtractor,
+    PdfBackend,
+    crop_bbox_to_png,
+    outline_entries_to_sections,
+    table_rows_have_real_content,
+    write_table_html,
+)
 from pcie_parser.render import render_object_markdown, render_section_markdown
 from pcie_parser.slug import content_hash, section_slug
 from pcie_parser.writer import assert_inside_project, replace_output_dir
@@ -89,7 +96,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for subdir in OBJECT_SUBDIRS.values():
             (objects_root / subdir).mkdir(parents=True, exist_ok=True)
 
-        _write_objects_and_assets(staged, pdf_path, objects, object_warnings, manifest)
+        _write_objects_and_assets(staged, pdf_path, spans, objects, object_warnings, manifest)
 
         seen_slugs: dict[str, str] = {}
 
@@ -202,46 +209,111 @@ def _normalize_outline_title(title: str) -> str:
 def _write_objects_and_assets(
     staged: Path,
     pdf_path: Path,
+    spans: list[TextSpan],
     objects: list[SourceObject],
     warnings: list[ParseWarning],
     manifest: Manifest,
 ) -> None:
     seen_ids: set[str] = set()
     seen_paths: set[str] = set()
+    asset_extractor: PdfAssetExtractor | None = None
 
-    for obj in objects:
-        if obj.object_id in seen_ids:
-            raise SystemExit(f"Duplicate object id {obj.object_id!r}")
-        seen_ids.add(obj.object_id)
+    try:
+        for obj in objects:
+            if obj.object_id in seen_ids:
+                raise SystemExit(f"Duplicate object id {obj.object_id!r}")
+            seen_ids.add(obj.object_id)
 
-        subdir = OBJECT_SUBDIRS[obj.object_type]
-        object_relative_path = Path("objects") / subdir / f"{obj.slug}.md"
-        _ensure_unique_output_path(object_relative_path, seen_paths, "object")
+            subdir = OBJECT_SUBDIRS[obj.object_type]
+            object_relative_path = Path("objects") / subdir / f"{obj.slug}.md"
+            _ensure_unique_output_path(object_relative_path, seen_paths, "object")
 
-        if obj.object_type in {"figure", "equation"} and obj.page is not None and obj.bbox is not None:
-            image_name = f"{obj.slug}.png"
-            image_relative_path = object_relative_path.parent / image_name
-            _ensure_unique_output_path(image_relative_path, seen_paths, "asset")
-            crop_bbox_to_png(pdf_path, obj.page, obj.bbox, staged / image_relative_path)
-            obj.asset_paths["image"] = image_name
-        elif obj.object_type == "table":
-            html_name = f"{obj.slug}.html"
-            html_relative_path = object_relative_path.parent / html_name
-            _ensure_unique_output_path(html_relative_path, seen_paths, "asset")
-            write_table_html(staged / html_relative_path, obj.title, [[obj.title]])
-            obj.asset_paths["html"] = html_name
+            caption_bbox = _caption_bbox_for_object(obj, spans)
+            if obj.object_type in {"figure", "equation"}:
+                if obj.page is not None and caption_bbox is not None:
+                    if asset_extractor is None:
+                        asset_extractor = PdfAssetExtractor(pdf_path)
+                    content_bbox = asset_extractor.infer_graphic_bbox_near_caption(
+                        obj.page,
+                        caption_bbox,
+                        obj.object_type,
+                    )
+                else:
+                    content_bbox = None
 
-        obj.content_hash = _object_content_hash(obj)
-        output_path = staged / object_relative_path
-        output_path.write_text(
-            render_object_markdown(obj, source_pdf=pdf_path.name),
-            encoding="utf-8",
-            newline="\n",
-        )
-        manifest.add(object_record(obj, object_relative_path.as_posix()))
+                if content_bbox is None:
+                    _mark_object_asset_unresolved(obj, warnings, "Could not infer a deterministic content bounding box")
+                else:
+                    obj.bbox = content_bbox
+                    image_name = f"{obj.slug}.png"
+                    image_relative_path = object_relative_path.parent / image_name
+                    _ensure_unique_output_path(image_relative_path, seen_paths, "asset")
+                    crop_bbox_to_png(pdf_path, obj.page, content_bbox, staged / image_relative_path)
+                    obj.asset_paths["image"] = image_name
+            elif obj.object_type == "table":
+                if obj.page is not None and caption_bbox is not None:
+                    if asset_extractor is None:
+                        asset_extractor = PdfAssetExtractor(pdf_path)
+                    extracted_table = asset_extractor.extract_table_rows_near_caption(obj.page, caption_bbox)
+                else:
+                    extracted_table = None
+
+                if extracted_table is None:
+                    _mark_object_asset_unresolved(obj, warnings, "Could not extract table rows near caption")
+                else:
+                    table_bbox, rows = extracted_table
+                    if not table_rows_have_real_content(rows, obj.title):
+                        _mark_object_asset_unresolved(
+                            obj,
+                            warnings,
+                            "Extracted table rows did not contain real table content",
+                        )
+                    else:
+                        obj.bbox = table_bbox
+                        html_name = f"{obj.slug}.html"
+                        html_relative_path = object_relative_path.parent / html_name
+                        _ensure_unique_output_path(html_relative_path, seen_paths, "asset")
+                        write_table_html(staged / html_relative_path, obj.title, rows)
+                        obj.asset_paths["html"] = html_name
+
+            obj.content_hash = _object_content_hash(obj)
+            output_path = staged / object_relative_path
+            output_path.write_text(
+                render_object_markdown(obj, source_pdf=pdf_path.name),
+                encoding="utf-8",
+                newline="\n",
+            )
+            manifest.add(object_record(obj, object_relative_path.as_posix()))
+    finally:
+        if asset_extractor is not None:
+            asset_extractor.close()
 
     for warning in warnings:
         manifest.add(warning_record(warning))
+
+
+def _caption_bbox_for_object(obj: SourceObject, spans: list[TextSpan]) -> BBox | None:
+    if obj.page is None or not obj.caption_hash:
+        return None
+    for span in spans:
+        if span.page == obj.page and content_hash(span.text) == obj.caption_hash:
+            return span.bbox
+    return None
+
+
+def _mark_object_asset_unresolved(obj: SourceObject, warnings: list[ParseWarning], reason: str) -> None:
+    if obj.status == "resolved":
+        obj.status = "resolved_no_asset"
+    warnings.append(
+        ParseWarning(
+            severity="warning",
+            code="object_asset_unresolved",
+            message=f"{reason} for {obj.object_id}",
+            page=obj.page or obj.listed_page,
+            section_id=obj.section_id,
+            object_id=obj.object_id,
+        )
+    )
 
 
 def _ensure_unique_output_path(path: Path, seen_paths: set[str], kind: str) -> None:

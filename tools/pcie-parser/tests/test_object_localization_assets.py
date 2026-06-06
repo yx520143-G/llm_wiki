@@ -4,9 +4,17 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from pcie_parser import cli
+from pcie_parser.manifest import Manifest
 from pcie_parser.models import BBox, SourceObject, TextSpan
 from pcie_parser.objects import extract_object_seeds_from_list_spans, localize_object_from_spans
-from pcie_parser.pdf_backend import crop_bbox_to_png, write_table_html
+from pcie_parser.pdf_backend import (
+    crop_bbox_to_png,
+    extract_table_rows_near_caption,
+    infer_graphic_bbox_near_caption,
+    table_rows_have_real_content,
+    write_table_html,
+)
 from pcie_parser.slug import content_hash
 
 
@@ -133,6 +141,79 @@ class ObjectLocalizationAssetTests(unittest.TestCase):
         self.assertIn("<td>&quot;quote&quot;</td>", html)
         self.assertNotIn("\r\n", html)
 
+    def test_table_rows_have_real_content_rejects_empty_and_title_only_rows(self):
+        self.assertFalse(table_rows_have_real_content([], "PCIe Signaling Characteristics"))
+        self.assertFalse(
+            table_rows_have_real_content(
+                [["PCIe Signaling Characteristics"]],
+                "PCIe Signaling Characteristics",
+            )
+        )
+        self.assertFalse(table_rows_have_real_content([[None, ""]], "PCIe Signaling Characteristics"))
+        self.assertTrue(
+            table_rows_have_real_content(
+                [["Signal", "Rate"], ["Gen1", "2.5 GT/s"]],
+                "PCIe Signaling Characteristics",
+            )
+        )
+
+    def test_cli_does_not_write_title_only_table_html_asset(self):
+        caption = span(
+            "Table 1-1 PCIe Signaling Characteristics",
+            page=1,
+            bbox=BBox(40.0, 40.0, 240.0, 55.0),
+        )
+        obj = make_object(
+            object_type="table",
+            object_number="1-1",
+            title="PCIe Signaling Characteristics",
+            listed_page=1,
+            page=1,
+            bbox=caption.bbox,
+            listed_in="List of Tables",
+            slug="table-1-1-pcie-signaling-characteristics",
+            caption_hash=content_hash(caption.text),
+            status="resolved",
+        )
+
+        class FakePdfAssetExtractor:
+            def __init__(self, _pdf_path: Path):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, _exc_type, _exc, _traceback):
+                return None
+
+            def close(self):
+                return None
+
+            def infer_graphic_bbox_near_caption(self, _page_number: int, _caption_bbox: BBox, _object_type: str):
+                return None
+
+            def extract_table_rows_near_caption(self, _page_number: int, _caption_bbox: BBox):
+                return BBox(40.0, 70.0, 240.0, 120.0), [[obj.title]]
+
+        original_extractor = cli.PdfAssetExtractor
+        try:
+            cli.PdfAssetExtractor = FakePdfAssetExtractor
+            with tempfile.TemporaryDirectory() as tmp:
+                staged = Path(tmp)
+                (staged / "objects" / "tables").mkdir(parents=True)
+                manifest = Manifest()
+                warnings = []
+
+                cli._write_objects_and_assets(staged, Path("source.pdf"), [caption], [obj], warnings, manifest)
+
+                html_path = staged / "objects" / "tables" / "table-1-1-pcie-signaling-characteristics.html"
+                self.assertFalse(html_path.exists())
+                self.assertNotIn("html", obj.asset_paths)
+                self.assertEqual(obj.status, "resolved_no_asset")
+                self.assertEqual([warning.code for warning in warnings], ["object_asset_unresolved"])
+        finally:
+            cli.PdfAssetExtractor = original_extractor
+
     def test_crop_bbox_to_png_writes_png_when_pymupdf_is_available(self):
         try:
             import fitz
@@ -152,6 +233,90 @@ class ObjectLocalizationAssetTests(unittest.TestCase):
 
             self.assertTrue(output_path.is_file())
             self.assertEqual(output_path.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
+
+    def test_infer_figure_bbox_extends_beyond_caption_to_drawn_content(self):
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest("PyMuPDF is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "figure.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=300)
+            page.draw_rect(fitz.Rect(80, 60, 220, 150))
+            page.insert_text((105, 105), "State A")
+            page.insert_text((72, 205), "Figure 4-72 L0s Substate Machine")
+            doc.save(pdf_path)
+            doc.close()
+
+            caption_bbox = BBox(72.0, 190.0, 250.0, 212.0)
+            inferred = infer_graphic_bbox_near_caption(pdf_path, 1, caption_bbox, "figure")
+
+            self.assertIsNotNone(inferred)
+            assert inferred is not None
+            self.assertLess(inferred.y0, caption_bbox.y0 - 40.0)
+            self.assertLessEqual(inferred.x0, 80.0)
+            self.assertGreaterEqual(inferred.x1, 220.0)
+
+    def test_infer_equation_bbox_extends_beyond_caption_to_formula_line(self):
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest("PyMuPDF is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "equation.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=300, height=240)
+            page.insert_text((70, 85), "CREDITS_CONSUMED = PAYLOAD_SIZE / CREDIT_SIZE")
+            page.insert_text((72, 132), "Equation 2-1 CREDITS_CONSUMED")
+            page.insert_text((72, 170), "This explanatory paragraph follows the caption.")
+            doc.save(pdf_path)
+            doc.close()
+
+            caption_bbox = BBox(72.0, 118.0, 245.0, 140.0)
+            inferred = infer_graphic_bbox_near_caption(pdf_path, 1, caption_bbox, "equation")
+
+            self.assertIsNotNone(inferred)
+            assert inferred is not None
+            self.assertLess(inferred.y0, caption_bbox.y0 - 20.0)
+            self.assertLess(inferred.y1, 150.0)
+
+    def test_extract_table_rows_near_caption_uses_real_pymupdf_table_rows_when_available(self):
+        try:
+            import fitz
+        except ImportError:
+            self.skipTest("PyMuPDF is not available")
+
+        if not hasattr(fitz.Page, "find_tables"):
+            self.skipTest("PyMuPDF table detection is not available")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "table.pdf"
+            doc = fitz.open()
+            page = doc.new_page(width=320, height=260)
+            page.insert_text((50, 50), "Table 1-1 PCIe Signaling Characteristics")
+            for y in (80, 110, 140):
+                page.draw_line((50, y), (260, y))
+            for x in (50, 150, 260):
+                page.draw_line((x, 80), (x, 140))
+            page.insert_text((65, 100), "Signal")
+            page.insert_text((170, 100), "Rate")
+            page.insert_text((65, 130), "Gen1")
+            page.insert_text((170, 130), "2.5 GT/s")
+            doc.save(pdf_path)
+            doc.close()
+
+            extracted = extract_table_rows_near_caption(pdf_path, 1, BBox(50.0, 35.0, 260.0, 60.0))
+
+            if extracted is None:
+                self.skipTest("PyMuPDF did not detect the synthetic table")
+            table_bbox, rows = extracted
+            self.assertLess(table_bbox.y0, 90.0)
+            flattened = [cell for row in rows for cell in row]
+            self.assertIn("Signal", flattened)
+            self.assertIn("2.5 GT/s", flattened)
 
 
 if __name__ == "__main__":

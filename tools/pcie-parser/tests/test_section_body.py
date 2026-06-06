@@ -133,6 +133,84 @@ class SectionBodyTests(unittest.TestCase):
         self.assertNotIn("4.2.6.7", body)
         self.assertNotIn("next body", body)
 
+    def test_split_vtx_heading_matches_without_adjacent_section_pollution(self):
+        sections = [
+            make_section("8.3.3.6", "Prior Measurement"),
+            make_section(
+                "8.3.3.7",
+                "Method for Measuring VTX-DIFF-PP at 8.0, 16.0, 32.0, 64.0, and 128.0 GT/s",
+            ),
+            make_section("8.3.3.8", "Next Measurement"),
+        ]
+        spans = [
+            span("8.3.3.6 Prior Measurement", line=0),
+            span("prior measurement body", line=1),
+            span(
+                "8.3.3.7 Method for Measuring V TX-DIFF-PP at 8.0, 16.0, 32.0, 64.0, and 128.0 GT/s",
+                line=2,
+            ),
+            span("target measurement body", line=3),
+            span("8.3.3.8 Next Measurement", line=4),
+            span("next measurement body", line=5),
+        ]
+
+        boundaries = build_section_span_boundaries(sections, spans)
+        body_spans = select_section_body_spans(sections[1], spans, boundaries)
+        body = spans_to_section_body(body_spans, [])
+
+        self.assertIn("8.3.3.7 Method for Measuring V TX-DIFF-PP", body)
+        self.assertIn("target measurement body", body)
+        self.assertNotIn("8.3.3.6", body)
+        self.assertNotIn("prior measurement body", body)
+        self.assertNotIn("8.3.3.8", body)
+        self.assertNotIn("next measurement body", body)
+
+    def test_split_ttx_heading_matches_without_adjacent_section_pollution(self):
+        sections = [
+            make_section("8.3.5.8", "Prior Jitter"),
+            make_section("8.3.5.9", "Random Jitter TTX-RJ (Informative)"),
+            make_section("8.3.5.10", "Next Jitter"),
+        ]
+        spans = [
+            span("8.3.5.8 Prior Jitter", line=0),
+            span("prior jitter body", line=1),
+            span("8.3.5.9 Random Jitter T TX-RJ (Informative)", line=2),
+            span("target jitter body", line=3),
+            span("8.3.5.10 Next Jitter", line=4),
+            span("next jitter body", line=5),
+        ]
+
+        boundaries = build_section_span_boundaries(sections, spans)
+        body_spans = select_section_body_spans(sections[1], spans, boundaries)
+        body = spans_to_section_body(body_spans, [])
+
+        self.assertIn("8.3.5.9 Random Jitter T TX-RJ", body)
+        self.assertIn("target jitter body", body)
+        self.assertNotIn("8.3.5.8", body)
+        self.assertNotIn("prior jitter body", body)
+        self.assertNotIn("8.3.5.10", body)
+        self.assertNotIn("next jitter body", body)
+
+    def test_missing_heading_fallback_returns_empty_window_instead_of_page_start(self):
+        sections = [
+            make_section("8.3.5.8", "Prior Jitter"),
+            make_section("8.3.5.9", "Random Jitter TTX-RJ (Informative)"),
+            make_section("8.3.5.10", "Next Jitter"),
+        ]
+        spans = [
+            span("8.3.5.8 heading text lost to extraction", line=0),
+            span("prior jitter body", line=1),
+            span("target jitter body without a recognizable heading", line=2),
+            span("8.3.5.10 heading text lost to extraction", line=3),
+            span("next jitter body", line=4),
+        ]
+
+        boundaries = build_section_span_boundaries(sections, spans)
+        body_spans = select_section_body_spans(sections[1], spans, boundaries)
+        body = spans_to_section_body(body_spans, [])
+
+        self.assertEqual("", body)
+
     def test_parent_section_stops_before_first_child_heading(self):
         parent = make_section("4.2.6", "L0s", level=3, page_end=516)
         child = make_section("4.2.6.1", "Entry", level=4, parent_id=parent.section_id, page_start=515, page_end=516)

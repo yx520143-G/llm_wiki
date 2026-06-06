@@ -340,7 +340,23 @@ def _matches_heading_text(text: str, normalized_candidates: set[str]) -> bool:
 
 
 def _normalize_heading_text(text: str) -> str:
-    return " ".join(re.sub(r"[^0-9a-z]+", " ", text.casefold()).split())
+    tokens = re.sub(r"[^0-9a-z]+", " ", text.casefold()).split()
+    return " ".join(_merge_split_signal_tokens(tokens))
+
+
+def _merge_split_signal_tokens(tokens: list[str]) -> list[str]:
+    merged: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        next_token = tokens[index + 1] if index + 1 < len(tokens) else ""
+        if len(token) == 1 and token.isalpha() and next_token in {"tx", "rx"}:
+            merged.append(f"{token}{next_token}")
+            index += 2
+            continue
+        merged.append(token)
+        index += 1
+    return merged
 
 
 def _fallback_section_start_key(
@@ -349,13 +365,11 @@ def _fallback_section_start_key(
     heading_anchors: dict[str, SpanOrderKey],
 ) -> SpanOrderKey:
     section = sections[section_index]
-    has_prior_same_page_heading = any(
-        prior_section.page_start == section.page_start and prior_section.section_id in heading_anchors
-        for prior_section in sections[:section_index]
-    )
-    if has_prior_same_page_heading:
-        return _page_after_key(section.page_end)
-    return _page_start_key(section.page_start)
+    for later_section in sections[section_index + 1 :]:
+        later_key = heading_anchors.get(later_section.section_id)
+        if later_key is not None and section.page_start <= later_key[0] <= section.page_end:
+            return later_key
+    return _page_after_key(section.page_end)
 
 
 def _span_order_key(span: TextSpan) -> SpanOrderKey:

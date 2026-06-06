@@ -1,25 +1,14 @@
 from __future__ import annotations
 
 import json
-import re
 from typing import Any
 
 from pcie_parser import PARSER_VERSION
 from pcie_parser.models import ObjectRef, ParagraphAnchor, SectionNode, SourceObject
 
 
-_PLAIN_SCALAR_RE = re.compile(r"^[A-Za-z0-9_./:+-]+$")
-
-
 def quote_yaml(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
-
-
-def yaml_list(values: list[str], indent: int = 0) -> str:
-    prefix = " " * indent
-    if not values:
-        return f"{prefix}[]"
-    return "\n".join(f"{prefix}- {quote_yaml(value)}" for value in values)
 
 
 def label_for_object_ref(object_id: str) -> str:
@@ -40,7 +29,7 @@ def render_section_markdown(section: SectionNode, source_pdf: str) -> str:
     body = section.body_markdown
     for ref in section.object_refs:
         placeholder = f"{{{{object:{ref.object_id}}}}}"
-        body = body.replace(placeholder, f"[{label_for_object_ref(ref.object_id)}]({ref.path})")
+        body = body.replace(placeholder, _section_object_link(ref))
 
     frontmatter = _frontmatter(
         [
@@ -78,7 +67,7 @@ def render_object_markdown(obj: SourceObject, source_pdf: str) -> str:
             ("object_id", obj.object_id),
             ("object_type", obj.object_type),
             ("object_number", obj.object_number),
-            ("object_title", obj.title),
+            ("title", obj.title),
             ("slug", obj.slug),
             ("listed_page", obj.listed_page),
             ("page", obj.page),
@@ -100,15 +89,52 @@ def _object_body_markdown(obj: SourceObject) -> str:
     lines: list[str] = []
     image_path = obj.asset_paths.get("image")
     if obj.object_type in {"figure", "equation"} and image_path:
-        lines.append(f"![{obj.title}]({image_path})")
+        lines.append(_object_asset_link(obj.title, image_path, image=True))
     if obj.object_type == "table":
-        html_path = obj.asset_paths.get("html")
-        json_path = obj.asset_paths.get("json")
-        if html_path:
-            lines.append(f"[HTML]({html_path})")
-        if json_path:
-            lines.append(f"[JSON]({json_path})")
+        for asset_key in ("image", "html", "json"):
+            asset_path = obj.asset_paths.get(asset_key)
+            if not asset_path:
+                continue
+            if asset_key == "image":
+                lines.append(_object_asset_link(obj.title, asset_path, image=True))
+            else:
+                lines.append(_object_asset_link(asset_key.upper(), asset_path))
     return "\n\n".join(lines)
+
+
+def _section_object_link(ref: ObjectRef) -> str:
+    return _markdown_link(label_for_object_ref(ref.object_id), ref.path)
+
+
+def _object_asset_link(label: str, destination: str, image: bool = False) -> str:
+    return _markdown_link(label, destination, image=image)
+
+
+def _markdown_link(label: str, destination: str, image: bool = False) -> str:
+    prefix = "!" if image else ""
+    return f"{prefix}[{_markdown_label(label)}](<{_markdown_destination(destination)}>)"
+
+
+def _markdown_label(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace("\r\n", " ")
+        .replace("\r", " ")
+        .replace("\n", " ")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+
+
+def _markdown_destination(value: str) -> str:
+    return (
+        value.replace("\r\n", "%0A")
+        .replace("\r", "%0A")
+        .replace("\n", "%0A")
+        .replace("\\", "\\\\")
+        .replace("<", "\\<")
+        .replace(">", "\\>")
+    )
 
 
 def _object_ref_record(ref: ObjectRef) -> dict[str, str]:
@@ -149,7 +175,7 @@ def _yaml_field(key: str, value: Any, indent: int = 0) -> list[str]:
         if not value:
             return [f"{prefix}{key}: {{}}"]
         lines = [f"{prefix}{key}:"]
-        for item_key, item_value in value.items():
+        for item_key, item_value in _sorted_dict_items(value):
             lines.extend(_yaml_field(item_key, item_value, indent + 2))
         return lines
     return [f"{prefix}{key}: {_yaml_scalar(value)}"]
@@ -162,7 +188,7 @@ def _yaml_list_item(value: Any, indent: int) -> list[str]:
             return [f"{prefix}- {{}}"]
         lines: list[str] = []
         first = True
-        for item_key, item_value in value.items():
+        for item_key, item_value in _sorted_dict_items(value):
             field_lines = _yaml_field(item_key, item_value, indent + 2)
             if first:
                 lines.append(f"{prefix}- {field_lines[0].lstrip()}")
@@ -189,7 +215,9 @@ def _yaml_scalar(value: Any) -> str:
     if isinstance(value, (int, float)):
         return json.dumps(value, ensure_ascii=False)
     if isinstance(value, str):
-        if value and _PLAIN_SCALAR_RE.match(value):
-            return value
         return quote_yaml(value)
     return quote_yaml(str(value))
+
+
+def _sorted_dict_items(value: dict[Any, Any]) -> list[tuple[Any, Any]]:
+    return sorted(value.items(), key=lambda item: str(item[0]))

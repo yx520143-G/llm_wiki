@@ -43,7 +43,7 @@ def object_record(obj: SourceObject, path: str) -> dict[str, Any]:
         "object_number": obj.object_number,
         "title": obj.title,
         "path": path,
-        "assets": obj.asset_paths,
+        "assets": dict(obj.asset_paths),
         "page": obj.page,
         "bbox": obj.bbox.as_list() if obj.bbox else None,
         "section_id": obj.section_id,

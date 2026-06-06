@@ -74,12 +74,16 @@ def spans_to_section_body(spans: list[TextSpan], objects: list[SourceObject]) ->
     return _body_items_to_markdown(body_items)
 
 
-def render_section_markdown(section: SectionNode, source_pdf: str) -> str:
+def render_section_body_markdown(section: SectionNode) -> str:
     body = section.body_markdown
     for ref in section.object_refs:
         placeholder = f"{{{{object:{ref.object_id}}}}}"
         body = body.replace(placeholder, _section_object_link(ref))
+    return body
 
+
+def render_section_markdown(section: SectionNode, source_pdf: str) -> str:
+    body = render_section_body_markdown(section)
     frontmatter = _frontmatter(
         [
             ("type", "pcie_section"),

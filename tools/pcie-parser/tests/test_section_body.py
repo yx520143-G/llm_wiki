@@ -1,8 +1,9 @@
 import unittest
 
-from pcie_parser.cli import relative_object_path_from_section
-from pcie_parser.models import BBox, SourceObject, TextSpan
-from pcie_parser.render import spans_to_section_body
+from pcie_parser.cli import build_section_span_boundaries, relative_object_path_from_section, select_section_body_spans
+from pcie_parser.models import BBox, ObjectRef, SectionNode, SourceObject, TextSpan
+from pcie_parser.render import render_section_body_markdown, render_section_markdown, spans_to_section_body
+from pcie_parser.slug import content_hash
 
 
 def span(
@@ -38,6 +39,20 @@ def make_object(**overrides: object) -> SourceObject:
     }
     values.update(overrides)
     return SourceObject(**values)
+
+
+def make_section(section_number: str, title: str, level: int = 4, **overrides: object) -> SectionNode:
+    values = {
+        "spec_version": "base-7.0",
+        "section_number": section_number,
+        "title": title,
+        "level": level,
+        "page_start": 515,
+        "page_end": 515,
+        "toc_path": [title],
+    }
+    values.update(overrides)
+    return SectionNode(**values)
 
 
 class SectionBodyTests(unittest.TestCase):
@@ -89,6 +104,74 @@ class SectionBodyTests(unittest.TestCase):
             relative_object_path_from_section(r"objects\figures\figure-4-72-l0s-substate-machine.md"),
             "../objects/figures/figure-4-72-l0s-substate-machine.md",
         )
+
+    def test_section_body_spans_exclude_same_page_adjacent_sections(self):
+        sections = [
+            make_section("4.2.6.5", "Prior State"),
+            make_section("4.2.6.6", "L0s Overview"),
+            make_section("4.2.6.7", "Next State"),
+        ]
+        spans = [
+            span("4.2.6.5 Prior State", line=0),
+            span("prior body", line=1),
+            span("4.2.6.6 L0s Overview", line=2),
+            span("current body", line=3),
+            span("Figure 4-72 belongs here", line=4),
+            span("4.2.6.7 Next State", line=5),
+            span("next body", line=6),
+        ]
+
+        boundaries = build_section_span_boundaries(sections, spans)
+        body_spans = select_section_body_spans(sections[1], spans, boundaries)
+        body = spans_to_section_body(body_spans, [])
+
+        self.assertIn("4.2.6.6 L0s Overview", body)
+        self.assertIn("current body", body)
+        self.assertIn("Figure 4-72 belongs here", body)
+        self.assertNotIn("4.2.6.5", body)
+        self.assertNotIn("prior body", body)
+        self.assertNotIn("4.2.6.7", body)
+        self.assertNotIn("next body", body)
+
+    def test_parent_section_stops_before_first_child_heading(self):
+        parent = make_section("4.2.6", "L0s", level=3, page_end=516)
+        child = make_section("4.2.6.1", "Entry", level=4, parent_id=parent.section_id, page_start=515, page_end=516)
+        parent.child_ids = [child.section_id]
+        sections = [parent, child]
+        spans = [
+            span("4.2.6 L0s", line=0),
+            span("parent intro only", line=1),
+            span("4.2.6.1 Entry", line=2),
+            span("child body", line=3),
+        ]
+
+        boundaries = build_section_span_boundaries(sections, spans)
+        body_spans = select_section_body_spans(parent, spans, boundaries)
+        body = spans_to_section_body(body_spans, [])
+
+        self.assertIn("4.2.6 L0s", body)
+        self.assertIn("parent intro only", body)
+        self.assertNotIn("4.2.6.1 Entry", body)
+        self.assertNotIn("child body", body)
+
+    def test_content_hash_matches_emitted_body_with_object_links(self):
+        section = make_section("4.2.6.6", "L0s Overview")
+        section.slug = "sec-4.2.6.6-l0s-overview"
+        section.body_markdown = "See {{object:base-7.0:figure:4-72}}."
+        section.object_refs = [
+            ObjectRef(
+                object_id="base-7.0:figure:4-72",
+                path="../objects/figures/figure-4-72-l0s-substate-machine.md",
+                occurrence="actual",
+            )
+        ]
+        section.content_hash = content_hash(render_section_body_markdown(section))
+
+        markdown = render_section_markdown(section, source_pdf="NCB-PCI_Express_Base_7.0.pdf")
+        emitted_body = markdown.split("---\n\n", 1)[1]
+
+        self.assertEqual(section.content_hash, content_hash(emitted_body))
+        self.assertIn("[Figure 4-72](<../objects/figures/figure-4-72-l0s-substate-machine.md>)", emitted_body)
 
 
 if __name__ == "__main__":

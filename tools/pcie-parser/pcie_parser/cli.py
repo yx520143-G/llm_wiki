@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import re
 import shutil
@@ -19,7 +20,12 @@ from pcie_parser.pdf_backend import (
     table_rows_have_real_content,
     write_table_html,
 )
-from pcie_parser.render import render_object_markdown, render_section_markdown, spans_to_section_body
+from pcie_parser.render import (
+    render_object_markdown,
+    render_section_body_markdown,
+    render_section_markdown,
+    spans_to_section_body,
+)
 from pcie_parser.slug import content_hash, section_slug
 from pcie_parser.writer import assert_inside_project, replace_output_dir
 
@@ -31,6 +37,14 @@ OBJECT_SUBDIRS = {
     "table": "tables",
     "equation": "equations",
 }
+SpanOrderKey = tuple[int, int, int, float, float, float, str]
+
+
+@dataclass(frozen=True)
+class SectionSpanBoundary:
+    start_key: SpanOrderKey
+    end_key: SpanOrderKey
+    heading_found: bool
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -99,6 +113,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         object_path_by_id = _write_objects_and_assets(staged, pdf_path, spans, objects, object_warnings, manifest)
 
         seen_slugs: dict[str, str] = {}
+        section_boundaries = build_section_span_boundaries(sections, spans)
 
         for section in sections:
             section.slug = section_slug(section.section_number, section.title)
@@ -109,7 +124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{previous_section_id!r} and {section.section_id!r}"
                 )
             seen_slugs[section.slug] = section.section_id
-            section_spans = [span for span in spans if section.page_start <= span.page <= section.page_end]
+            section_spans = select_section_body_spans(section, spans, section_boundaries)
             section_objects = [obj for obj in objects if obj.section_id == section.section_id]
             section.object_refs = [
                 ObjectRef(
@@ -121,7 +136,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if obj.object_id in object_path_by_id
             ]
             section.body_markdown = spans_to_section_body(section_spans, section_objects)
-            section.content_hash = content_hash(section.body_markdown)
+            section.content_hash = content_hash(render_section_body_markdown(section))
 
             relative_path = Path("sections") / f"{section.slug}.md"
             output_path = staged / relative_path
@@ -215,6 +230,144 @@ def _outline_page_ranges_for_title(
 
 def _normalize_outline_title(title: str) -> str:
     return " ".join(title.strip().split()).lower()
+
+
+def build_section_span_boundaries(
+    sections: list[SectionNode],
+    spans: list[TextSpan],
+) -> dict[str, SectionSpanBoundary]:
+    heading_anchors = _section_heading_anchors(sections, spans)
+    boundaries: dict[str, SectionSpanBoundary] = {}
+    for index, section in enumerate(sections):
+        start_key = heading_anchors.get(section.section_id)
+        heading_found = start_key is not None
+        if start_key is None:
+            start_key = _fallback_section_start_key(index, sections, heading_anchors)
+
+        end_key = _page_after_key(section.page_end)
+        for later_section in sections[index + 1 :]:
+            later_key = heading_anchors.get(later_section.section_id)
+            if later_key is not None and start_key <= later_key < end_key:
+                end_key = later_key
+
+        if end_key < start_key:
+            end_key = start_key
+
+        boundaries[section.section_id] = SectionSpanBoundary(
+            start_key=start_key,
+            end_key=end_key,
+            heading_found=heading_found,
+        )
+    return boundaries
+
+
+def select_section_body_spans(
+    section: SectionNode,
+    spans: list[TextSpan],
+    boundaries: dict[str, SectionSpanBoundary],
+) -> list[TextSpan]:
+    boundary = boundaries[section.section_id]
+    return [
+        span
+        for span in spans
+        if boundary.start_key <= _span_order_key(span) < boundary.end_key
+        and section.page_start <= span.page <= section.page_end
+    ]
+
+
+def _section_heading_anchors(
+    sections: list[SectionNode],
+    spans: list[TextSpan],
+) -> dict[str, SpanOrderKey]:
+    lines = _text_lines_by_page(spans)
+    anchors: dict[str, SpanOrderKey] = {}
+    for section in sections:
+        candidates = _normalized_heading_candidates(section)
+        page_lines = lines.get(section.page_start, [])
+        for line_index, line in enumerate(page_lines):
+            line_text = line.text
+            next_line_text = page_lines[line_index + 1].text if line_index + 1 < len(page_lines) else ""
+            if _matches_heading_text(line_text, candidates) or _matches_heading_text(
+                f"{line_text} {next_line_text}",
+                candidates,
+            ):
+                anchors[section.section_id] = line.order_key
+                break
+    return anchors
+
+
+@dataclass(frozen=True)
+class _TextLine:
+    text: str
+    order_key: SpanOrderKey
+
+
+def _text_lines_by_page(spans: list[TextSpan]) -> dict[int, list[_TextLine]]:
+    grouped_spans: dict[tuple[int, int, int], list[TextSpan]] = {}
+    for span in spans:
+        grouped_spans.setdefault((span.page, span.block, span.line), []).append(span)
+
+    lines_by_page: dict[int, list[_TextLine]] = {}
+    for (page, _block, _line), line_spans in grouped_spans.items():
+        sorted_line_spans = sorted(line_spans, key=_span_order_key)
+        text = " ".join(span.text.strip() for span in sorted_line_spans if span.text.strip())
+        if not text:
+            continue
+        order_key = min((_span_order_key(span) for span in sorted_line_spans), default=_page_start_key(page))
+        lines_by_page.setdefault(page, []).append(_TextLine(text=text, order_key=order_key))
+
+    for page, lines in lines_by_page.items():
+        lines_by_page[page] = sorted(lines, key=lambda line: line.order_key)
+    return lines_by_page
+
+
+def _normalized_heading_candidates(section: SectionNode) -> set[str]:
+    numbered_title = f"{section.section_number} {section.title}"
+    return {
+        _normalize_heading_text(candidate)
+        for candidate in (
+            numbered_title,
+            f"Section {numbered_title}",
+            f"Chapter {numbered_title}",
+            f"Appendix {numbered_title}",
+        )
+    }
+
+
+def _matches_heading_text(text: str, normalized_candidates: set[str]) -> bool:
+    normalized_text = _normalize_heading_text(text)
+    return any(normalized_text.startswith(candidate) for candidate in normalized_candidates if candidate)
+
+
+def _normalize_heading_text(text: str) -> str:
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", text.casefold()).split())
+
+
+def _fallback_section_start_key(
+    section_index: int,
+    sections: list[SectionNode],
+    heading_anchors: dict[str, SpanOrderKey],
+) -> SpanOrderKey:
+    section = sections[section_index]
+    has_prior_same_page_heading = any(
+        prior_section.page_start == section.page_start and prior_section.section_id in heading_anchors
+        for prior_section in sections[:section_index]
+    )
+    if has_prior_same_page_heading:
+        return _page_after_key(section.page_end)
+    return _page_start_key(section.page_start)
+
+
+def _span_order_key(span: TextSpan) -> SpanOrderKey:
+    return (span.page, span.block, span.line, float(span.span), span.bbox.y0, span.bbox.x0, span.text)
+
+
+def _page_start_key(page: int) -> SpanOrderKey:
+    return (page, -1, -1, float("-inf"), float("-inf"), float("-inf"), "")
+
+
+def _page_after_key(page: int) -> SpanOrderKey:
+    return (page + 1, -1, -1, float("-inf"), float("-inf"), float("-inf"), "")
 
 
 def _write_objects_and_assets(

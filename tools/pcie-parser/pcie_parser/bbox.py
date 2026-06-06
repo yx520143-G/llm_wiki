@@ -22,4 +22,4 @@ def bbox_contains(outer: BBox, inner: BBox) -> bool:
 
 
 def bbox_intersects(a: BBox, b: BBox) -> bool:
-    return a.x0 < b.x1 and a.x1 > b.x0 and a.y0 < b.y1 and a.y1 > b.y0
+    return min(a.x1, b.x1) > max(a.x0, b.x0) and min(a.y1, b.y1) > max(a.y0, b.y0)

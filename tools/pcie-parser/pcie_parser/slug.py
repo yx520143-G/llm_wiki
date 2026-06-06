@@ -24,13 +24,14 @@ def ascii_slug(value: str) -> str:
     text = text.encode("ascii", "ignore").decode("ascii")
     text = text.lower()
     text = re.sub(r"[^a-z0-9.]+", "-", text)
-    text = re.sub(r"-+", "-", text).strip("-")
+    text = re.sub(r"\.{2,}", ".", text)
+    text = re.sub(r"-+", "-", text).strip("-.")
     return text or "untitled"
 
 
 def section_slug(section_number: str, title: str) -> str:
-    return f"sec-{section_number}-{ascii_slug(title)}"
+    return f"sec-{ascii_slug(section_number)}-{ascii_slug(title)}"
 
 
 def object_slug(object_type: str, object_number: str, title: str) -> str:
-    return f"{object_type}-{object_number}-{ascii_slug(title)}"
+    return f"{ascii_slug(object_type)}-{ascii_slug(object_number)}-{ascii_slug(title)}"

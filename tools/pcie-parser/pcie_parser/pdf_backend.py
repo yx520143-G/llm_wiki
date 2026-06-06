@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import math
 import re
 from numbers import Real
@@ -147,6 +148,54 @@ def span_dict_to_text_span(text: str, page: int, bbox: Sequence[float], block: i
         line=line,
         span=span,
     )
+
+
+def crop_bbox_to_png(pdf_path: Path, page_number: int, bbox: BBox, output_path: Path, zoom: float = 2.0) -> None:
+    import fitz
+
+    doc = fitz.open(pdf_path)
+    try:
+        if page_number < 1 or page_number > doc.page_count:
+            raise ValueError(f"page_number {page_number} is outside PDF page range 1..{doc.page_count}")
+
+        page = doc.load_page(page_number - 1)
+        page_rect = page.rect
+        x0 = max(float(bbox.x0), float(page_rect.x0))
+        y0 = max(float(bbox.y0), float(page_rect.y0))
+        x1 = min(float(bbox.x1), float(page_rect.x1))
+        y1 = min(float(bbox.y1), float(page_rect.y1))
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError(f"empty crop for page {page_number}: {bbox.as_list()}")
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pixmap = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=fitz.Rect(x0, y0, x1, y1), alpha=False)
+        pixmap.save(output_path)
+    finally:
+        doc.close()
+
+
+def write_table_html(path: Path, caption: str, rows: list[list[str]]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "<!doctype html>",
+        '<html lang="en">',
+        "<head>",
+        '  <meta charset="utf-8">',
+        f"  <title>{html.escape(caption, quote=True)}</title>",
+        "</head>",
+        "<body>",
+        "<table>",
+        f"  <caption>{html.escape(caption, quote=True)}</caption>",
+    ]
+    for row in rows:
+        lines.append("  <tr>")
+        for cell in row:
+            lines.append(f"    <td>{html.escape(str(cell), quote=True)}</td>")
+        lines.append("  </tr>")
+    lines.extend(["</table>", "</body>", "</html>"])
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
 
 class PdfBackend:

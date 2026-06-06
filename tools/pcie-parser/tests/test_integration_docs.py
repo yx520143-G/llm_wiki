@@ -11,8 +11,12 @@ class IntegrationDocsTests(unittest.TestCase):
         combined = f"{readme}\n{schema}"
         readme_one_line = " ".join(readme.split())
 
-        self.assertIn("cd <llm-wiki-repo-root>", readme)
+        self.assertIn(
+            "From the LLM-Wiki repository root that contains `tools/pcie-parser`, run:",
+            readme,
+        )
         self.assertIn("py -3", readme)
+        self.assertNotIn("cd <llm-wiki-repo-root>", readme)
         self.assertNotIn(r"python tools\pcie-parser", readme)
 
         self.assertIn("Source Watch", readme)

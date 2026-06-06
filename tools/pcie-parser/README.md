@@ -33,10 +33,9 @@ When enabling LLM-Wiki Source Watch for a PCIe project:
   to `pcie_object` wrappers and their assets, but linked asset files are not raw
   sources.
 
-Run:
+From the LLM-Wiki repository root that contains `tools/pcie-parser`, run:
 
 ```powershell
-cd <llm-wiki-repo-root>
 py -3 tools\pcie-parser\parse_pcie_spec.py `
   --project D:\LLMWiki\PCIe-base-spec\PCIe-base-spec `
   --pdf D:\LLMWiki\PCIe-base-spec\PCIe-base-spec\raw\originals\NCB-PCI_Express_Base_7.0.pdf `

@@ -6,7 +6,7 @@ from pathlib import Path
 
 from pcie_parser import cli
 from pcie_parser.manifest import Manifest
-from pcie_parser.models import BBox, SourceObject, TextSpan
+from pcie_parser.models import BBox, ObjectRef, SectionNode, SourceObject, TextSpan
 from pcie_parser.objects import extract_object_seeds_from_list_spans, localize_object_from_spans
 from pcie_parser.pdf_backend import (
     crop_bbox_to_png,
@@ -15,6 +15,7 @@ from pcie_parser.pdf_backend import (
     table_rows_have_real_content,
     write_table_html,
 )
+from pcie_parser.render import render_section_body_markdown, spans_to_section_body
 from pcie_parser.slug import content_hash
 
 
@@ -211,6 +212,104 @@ class ObjectLocalizationAssetTests(unittest.TestCase):
                 self.assertNotIn("html", obj.asset_paths)
                 self.assertEqual(obj.status, "resolved_no_asset")
                 self.assertEqual([warning.code for warning in warnings], ["object_asset_unresolved"])
+        finally:
+            cli.PdfAssetExtractor = original_extractor
+
+    def test_unresolved_figure_asset_uses_source_bbox_to_remove_internal_section_rows(self):
+        caption = span(
+            "Figure 4-54 FEC Table: i to alpha i",
+            page=459,
+            bbox=BBox(240.0, 660.0, 360.0, 675.0),
+            block=4,
+        )
+        internal_row = span(
+            "00: ff 01: 00 02: 01",
+            page=459,
+            bbox=BBox(148.0, 290.0, 446.0, 300.0),
+            block=3,
+        )
+        obj = make_object(
+            object_type="figure",
+            object_number="4-54",
+            title="FEC Table: i to alpha i",
+            listed_page=459,
+            page=459,
+            bbox=BBox(234.0, 624.0, 366.0, 711.0),
+            listed_in="List of Figures",
+            slug="figure-4-54-fec-table-i-to-alpha-i",
+            section_id="base-7.0:section:4.2.3.4.5",
+            caption_hash=content_hash(caption.text),
+            status="resolved",
+        )
+
+        class FakePdfAssetExtractor:
+            def __init__(self, _pdf_path: Path):
+                pass
+
+            def close(self):
+                return None
+
+            def infer_graphic_bbox_near_caption(self, _page_number: int, _caption_bbox: BBox, _object_type: str):
+                return None
+
+            def extract_table_rows_near_caption(self, _page_number: int, _caption_bbox: BBox):
+                return None
+
+        original_extractor = cli.PdfAssetExtractor
+        try:
+            cli.PdfAssetExtractor = FakePdfAssetExtractor
+            with tempfile.TemporaryDirectory() as tmp:
+                staged = Path(tmp)
+                (staged / "objects" / "figures").mkdir(parents=True)
+                manifest = Manifest()
+                warnings = []
+
+                object_paths = cli._write_objects_and_assets(
+                    staged,
+                    Path("source.pdf"),
+                    [internal_row, caption],
+                    [obj],
+                    warnings,
+                    manifest,
+                )
+
+                section = SectionNode(
+                    spec_version="base-7.0",
+                    section_number="4.2.3.4.5",
+                    title="ECC Bytes in Flit",
+                    level=5,
+                    page_start=459,
+                    page_end=459,
+                    toc_path=["ECC Bytes in Flit"],
+                    object_refs=[
+                        ObjectRef(
+                            object_id=obj.object_id,
+                            path=cli.relative_object_path_from_section(object_paths[obj.object_id]),
+                            occurrence="actual",
+                        )
+                    ],
+                )
+                section.body_markdown = spans_to_section_body(
+                    [
+                        internal_row,
+                        caption,
+                        span(
+                            "Visible paragraph after figure.",
+                            page=459,
+                            bbox=BBox(72.0, 720.0, 260.0, 735.0),
+                            block=5,
+                        ),
+                    ],
+                    [obj],
+                )
+                emitted_body = render_section_body_markdown(section)
+
+                self.assertEqual(obj.status, "resolved_no_asset")
+                self.assertEqual(obj.asset_paths, {})
+                self.assertEqual([warning.code for warning in warnings], ["object_asset_unresolved"])
+                self.assertIn("[Figure 4-54](<../objects/figures/figure-4-54-fec-table-i-to-alpha-i.md>)", emitted_body)
+                self.assertNotIn("00: ff 01: 00", emitted_body)
+                self.assertIn("Visible paragraph after figure.", emitted_body)
         finally:
             cli.PdfAssetExtractor = original_extractor
 

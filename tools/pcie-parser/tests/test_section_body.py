@@ -1,6 +1,11 @@
 import unittest
 
-from pcie_parser.cli import build_section_span_boundaries, relative_object_path_from_section, select_section_body_spans
+from pcie_parser.cli import (
+    build_paragraph_anchors,
+    build_section_span_boundaries,
+    relative_object_path_from_section,
+    select_section_body_spans,
+)
 from pcie_parser.models import BBox, ObjectRef, SectionNode, SourceObject, TextSpan
 from pcie_parser.render import render_section_body_markdown, render_section_markdown, spans_to_section_body
 from pcie_parser.slug import content_hash
@@ -250,6 +255,22 @@ class SectionBodyTests(unittest.TestCase):
 
         self.assertEqual(section.content_hash, content_hash(emitted_body))
         self.assertIn("[Figure 4-72](<../objects/figures/figure-4-72-l0s-substate-machine.md>)", emitted_body)
+
+    def test_paragraph_anchors_exclude_spans_removed_as_object_internals(self):
+        body_spans = [
+            span("Visible paragraph.", bbox=BBox(72.0, 100.0, 210.0, 120.0), block=0),
+            span("00: ff 01: 00", bbox=BBox(110.0, 170.0, 210.0, 185.0), block=1),
+            span("Trailing paragraph.", bbox=BBox(72.0, 260.0, 220.0, 280.0), block=2),
+        ]
+
+        anchors = build_paragraph_anchors(body_spans, [make_object()])
+
+        self.assertEqual([anchor.id for anchor in anchors], ["p0001", "p0002"])
+        self.assertEqual([anchor.page for anchor in anchors], [515, 515])
+        self.assertEqual(anchors[0].bbox.as_list(), [72.0, 100.0, 210.0, 120.0])
+        self.assertEqual(anchors[0].hash, content_hash("Visible paragraph."))
+        self.assertEqual(anchors[1].hash, content_hash("Trailing paragraph."))
+        self.assertNotIn(content_hash("00: ff 01: 00"), {anchor.hash for anchor in anchors})
 
 
 if __name__ == "__main__":

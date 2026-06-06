@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from pcie_parser.models import BBox, TextSpan
 from pcie_parser.cli import main, parse_args, validate_version, version_output_dir
 from pcie_parser.slug import content_hash
 
@@ -35,6 +36,24 @@ def write_existing_final(project_root: Path, version: str = "base-7.0") -> Path:
     final_dir.mkdir(parents=True)
     (final_dir / "old.txt").write_text("old", encoding="utf-8")
     return final_dir
+
+
+def span(
+    text: str,
+    page: int = 1,
+    bbox: BBox | None = None,
+    block: int = 0,
+    line: int = 0,
+    span_index: int = 0,
+) -> TextSpan:
+    return TextSpan(
+        text=text,
+        page=page,
+        bbox=bbox or BBox(72.0, 100.0, 400.0, 120.0),
+        block=block,
+        line=line,
+        span=span_index,
+    )
 
 
 class CliTests(unittest.TestCase):
@@ -88,6 +107,31 @@ class CliTests(unittest.TestCase):
         self.assertEqual(record["id"], "base-7.0:section:1")
         self.assertEqual(record["path"], "sections/sec-1-scope.md")
         self.assertEqual(record["content_hash"], content_hash(""))
+
+    def test_main_writes_paragraph_anchors_for_section_body_spans(self):
+        project_root, pdf_path = make_temp_project(self)
+        outline_entries = [(1, "Section 1. Scope", 1)]
+        spans = [
+            span("1 Scope", bbox=BBox(72.0, 80.0, 160.0, 96.0), block=0, line=0),
+            span("Scope body paragraph.", bbox=BBox(72.0, 120.0, 260.0, 138.0), block=1, line=0),
+        ]
+
+        with mock.patch("pcie_parser.cli.PdfBackend") as backend_class:
+            backend_class.return_value.extract_outline.return_value = (outline_entries, 1)
+            backend_class.return_value.extract_text_spans.return_value = spans
+
+            result = main(main_args(project_root, pdf_path))
+
+        self.assertEqual(result, 0)
+        section_path = version_output_dir(project_root, "base-7.0") / "sections" / "sec-1-scope.md"
+        markdown = section_path.read_text(encoding="utf-8")
+
+        self.assertIn("paragraph_anchors:", markdown)
+        self.assertIn('id: "p0001"', markdown)
+        self.assertIn("page: 1", markdown)
+        self.assertIn("bbox:", markdown)
+        self.assertIn('hash: "sha256:', markdown)
+        self.assertIn("Scope body paragraph.", markdown)
 
     def test_main_rejects_invalid_version_before_output_mutation(self):
         invalid_versions = ["", " ", ".", "..", "../base-7.0", r"base\7.0", str(Path.cwd())]

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Sequence
 
 from pcie_parser.manifest import Manifest, object_record, section_record, warning_record
-from pcie_parser.models import BBox, ObjectRef, ParseWarning, SectionNode, SourceObject, TextSpan
+from pcie_parser.models import BBox, ObjectRef, ParagraphAnchor, ParseWarning, SectionNode, SourceObject, TextSpan
 from pcie_parser.objects import extract_object_seeds_from_list_spans, localize_object_from_spans
 from pcie_parser.pdf_backend import (
     PdfAssetExtractor,
@@ -25,6 +25,7 @@ from pcie_parser.render import (
     render_section_body_markdown,
     render_section_markdown,
     spans_to_section_body,
+    visible_section_body_spans,
 )
 from pcie_parser.slug import content_hash, section_slug
 from pcie_parser.writer import assert_inside_project, replace_output_dir
@@ -37,6 +38,9 @@ OBJECT_SUBDIRS = {
     "table": "tables",
     "equation": "equations",
 }
+_FALLBACK_FIGURE_VERTICAL_WINDOW = 520.0
+_FALLBACK_TABLE_VERTICAL_WINDOW = 520.0
+_FALLBACK_EQUATION_VERTICAL_WINDOW = 160.0
 SpanOrderKey = tuple[int, int, int, float, float, float, str]
 
 
@@ -136,6 +140,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if obj.object_id in object_path_by_id
             ]
             section.body_markdown = spans_to_section_body(section_spans, section_objects)
+            section.paragraph_anchors = build_paragraph_anchors(section_spans, section_objects)
             section.content_hash = content_hash(render_section_body_markdown(section))
 
             relative_path = Path("sections") / f"{section.slug}.md"
@@ -384,6 +389,62 @@ def _page_after_key(page: int) -> SpanOrderKey:
     return (page + 1, -1, -1, float("-inf"), float("-inf"), float("-inf"), "")
 
 
+def build_paragraph_anchors(spans: list[TextSpan], objects: list[SourceObject]) -> list[ParagraphAnchor]:
+    anchors: list[ParagraphAnchor] = []
+    groups: dict[tuple[int, int], list[TextSpan]] = {}
+    for span in visible_section_body_spans(spans, objects):
+        groups.setdefault((span.page, span.block), []).append(span)
+
+    anchor_index = 1
+    for group in groups.values():
+        text = _anchor_text_from_spans(group)
+        if not text:
+            continue
+        anchors.append(
+            ParagraphAnchor(
+                id=f"p{anchor_index:04d}",
+                page=group[0].page,
+                bbox=_union_span_bboxes(group),
+                hash=content_hash(text),
+            )
+        )
+        anchor_index += 1
+    return anchors
+
+
+def _anchor_text_from_spans(spans: list[TextSpan]) -> str:
+    line_texts: list[str] = []
+    grouped_lines: dict[tuple[int, int, int], list[TextSpan]] = {}
+    for span in sorted(spans, key=_span_order_key):
+        grouped_lines.setdefault((span.page, span.block, span.line), []).append(span)
+
+    for line_spans in grouped_lines.values():
+        text = " ".join(_normalized_anchor_text(span.text) for span in sorted(line_spans, key=_span_order_key))
+        text = _normalized_anchor_text(text)
+        if text:
+            line_texts.append(text)
+    return "\n".join(line_texts)
+
+
+def _normalized_anchor_text(text: str) -> str:
+    return " ".join(text.strip().split())
+
+
+def _union_span_bboxes(spans: list[TextSpan]) -> BBox:
+    return _union_bboxes([span.bbox for span in spans])
+
+
+def _union_bboxes(boxes: list[BBox]) -> BBox:
+    if not boxes:
+        raise ValueError("Cannot union an empty bbox list")
+    return BBox(
+        x0=min(box.x0 for box in boxes),
+        y0=min(box.y0 for box in boxes),
+        x1=max(box.x1 for box in boxes),
+        y1=max(box.y1 for box in boxes),
+    )
+
+
 def _write_objects_and_assets(
     staged: Path,
     pdf_path: Path,
@@ -396,6 +457,8 @@ def _write_objects_and_assets(
     seen_paths: set[str] = set()
     object_path_by_id: dict[str, str] = {}
     asset_extractor: PdfAssetExtractor | None = None
+    caption_bboxes_by_id = _caption_bboxes_for_objects(objects, spans)
+    caption_bboxes_by_page = _caption_bboxes_by_page(objects, caption_bboxes_by_id)
 
     try:
         for obj in objects:
@@ -408,7 +471,7 @@ def _write_objects_and_assets(
             _ensure_unique_output_path(object_relative_path, seen_paths, "object")
             object_path_by_id[obj.object_id] = object_relative_path.as_posix()
 
-            caption_bbox = _caption_bbox_for_object(obj, spans)
+            caption_bbox = caption_bboxes_by_id.get(obj.object_id)
             if obj.object_type in {"figure", "equation"}:
                 if obj.page is not None and caption_bbox is not None:
                     if asset_extractor is None:
@@ -422,6 +485,7 @@ def _write_objects_and_assets(
                     content_bbox = None
 
                 if content_bbox is None:
+                    _set_unresolved_source_bbox(obj, spans, caption_bbox, caption_bboxes_by_page)
                     _mark_object_asset_unresolved(obj, warnings, "Could not infer a deterministic content bounding box")
                 else:
                     obj.bbox = content_bbox
@@ -439,10 +503,12 @@ def _write_objects_and_assets(
                     extracted_table = None
 
                 if extracted_table is None:
+                    _set_unresolved_source_bbox(obj, spans, caption_bbox, caption_bboxes_by_page)
                     _mark_object_asset_unresolved(obj, warnings, "Could not extract table rows near caption")
                 else:
                     table_bbox, rows = extracted_table
                     if not table_rows_have_real_content(rows, obj.title):
+                        _set_unresolved_source_bbox(obj, spans, caption_bbox, caption_bboxes_by_page)
                         _mark_object_asset_unresolved(
                             obj,
                             warnings,
@@ -484,6 +550,110 @@ def _caption_bbox_for_object(obj: SourceObject, spans: list[TextSpan]) -> BBox |
         if span.page == obj.page and content_hash(span.text) == obj.caption_hash:
             return span.bbox
     return None
+
+
+def _caption_bboxes_for_objects(objects: list[SourceObject], spans: list[TextSpan]) -> dict[str, BBox]:
+    return {
+        obj.object_id: caption_bbox
+        for obj in objects
+        if (caption_bbox := _caption_bbox_for_object(obj, spans)) is not None
+    }
+
+
+def _caption_bboxes_by_page(
+    objects: list[SourceObject],
+    caption_bboxes_by_id: dict[str, BBox],
+) -> dict[int, list[tuple[str, BBox]]]:
+    by_page: dict[int, list[tuple[str, BBox]]] = {}
+    for obj in objects:
+        if obj.page is None:
+            continue
+        caption_bbox = caption_bboxes_by_id.get(obj.object_id)
+        if caption_bbox is None:
+            continue
+        by_page.setdefault(obj.page, []).append((obj.object_id, caption_bbox))
+    for page, entries in by_page.items():
+        by_page[page] = sorted(entries, key=lambda entry: (entry[1].y0, entry[1].x0, entry[0]))
+    return by_page
+
+
+def _set_unresolved_source_bbox(
+    obj: SourceObject,
+    spans: list[TextSpan],
+    caption_bbox: BBox | None,
+    caption_bboxes_by_page: dict[int, list[tuple[str, BBox]]],
+) -> None:
+    fallback_bbox = _infer_unresolved_source_bbox(obj, spans, caption_bbox, caption_bboxes_by_page)
+    if fallback_bbox is not None:
+        obj.bbox = fallback_bbox
+
+
+def _infer_unresolved_source_bbox(
+    obj: SourceObject,
+    spans: list[TextSpan],
+    caption_bbox: BBox | None,
+    caption_bboxes_by_page: dict[int, list[tuple[str, BBox]]],
+) -> BBox | None:
+    if obj.page is None or caption_bbox is None:
+        return None
+
+    top, bottom = _fallback_source_vertical_bounds(
+        obj,
+        caption_bbox,
+        [
+            bbox
+            for object_id, bbox in caption_bboxes_by_page.get(obj.page, [])
+            if object_id != obj.object_id
+        ],
+    )
+    candidate_spans = [
+        span
+        for span in spans
+        if span.page == obj.page and _span_inside_vertical_bounds(span, top, bottom)
+    ]
+    if not candidate_spans:
+        return caption_bbox
+    return _union_span_bboxes(candidate_spans)
+
+
+def _fallback_source_vertical_bounds(
+    obj: SourceObject,
+    caption_bbox: BBox,
+    other_caption_bboxes: list[BBox],
+) -> tuple[float, float]:
+    previous_caption_bottoms = [
+        bbox.y1 for bbox in other_caption_bboxes if bbox.y1 <= caption_bbox.y0
+    ]
+    next_caption_tops = [
+        bbox.y0 for bbox in other_caption_bboxes if bbox.y0 >= caption_bbox.y1
+    ]
+    previous_boundary = max(previous_caption_bottoms) if previous_caption_bottoms else None
+    next_boundary = min(next_caption_tops) if next_caption_tops else None
+
+    if obj.object_type == "table":
+        top = caption_bbox.y0
+        bottom = caption_bbox.y1 + _FALLBACK_TABLE_VERTICAL_WINDOW
+        if next_boundary is not None:
+            bottom = min(bottom, next_boundary)
+        return top, bottom
+
+    if obj.object_type == "equation":
+        top = caption_bbox.y0 - _FALLBACK_EQUATION_VERTICAL_WINDOW
+        bottom = caption_bbox.y1 + _FALLBACK_EQUATION_VERTICAL_WINDOW
+        if previous_boundary is not None:
+            top = max(top, previous_boundary)
+        if next_boundary is not None:
+            bottom = min(bottom, next_boundary)
+        return top, bottom
+
+    top = caption_bbox.y0 - _FALLBACK_FIGURE_VERTICAL_WINDOW
+    if previous_boundary is not None:
+        top = max(top, previous_boundary)
+    return top, caption_bbox.y1
+
+
+def _span_inside_vertical_bounds(span: TextSpan, top: float, bottom: float) -> bool:
+    return top <= span.bbox.y0 and span.bbox.y1 <= bottom
 
 
 def _mark_object_asset_unresolved(obj: SourceObject, warnings: list[ParseWarning], reason: str) -> None:

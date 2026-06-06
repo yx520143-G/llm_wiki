@@ -74,6 +74,12 @@ def spans_to_section_body(spans: list[TextSpan], objects: list[SourceObject]) ->
     return _body_items_to_markdown(body_items)
 
 
+def visible_section_body_spans(spans: list[TextSpan], objects: list[SourceObject]) -> list[TextSpan]:
+    ordered_spans = sorted(spans, key=_span_order_key)
+    object_entries = _section_object_entries(objects, ordered_spans)
+    return [span for span in ordered_spans if _containing_object_entry(span, object_entries) is None]
+
+
 def render_section_body_markdown(section: SectionNode) -> str:
     body = section.body_markdown
     for ref in section.object_refs:

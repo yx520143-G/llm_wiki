@@ -50,6 +50,13 @@ class ModelTests(unittest.TestCase):
         )
         self.assertEqual(ref.occurrence, "actual")
 
+    def test_model_refs_are_exported_from_package(self):
+        from pcie_parser import ObjectRef as ExportedObjectRef
+        from pcie_parser import ParagraphAnchor as ExportedParagraphAnchor
+
+        self.assertIs(ExportedObjectRef, ObjectRef)
+        self.assertIs(ExportedParagraphAnchor, ParagraphAnchor)
+
 
 if __name__ == "__main__":
     unittest.main()

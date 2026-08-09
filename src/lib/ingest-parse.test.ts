@@ -18,7 +18,20 @@
  * to dropping pages without telling anyone.
  */
 import { describe, it, expect } from "vitest"
-import { parseFileBlocks, isSafeIngestPath } from "./ingest"
+import {
+  parseFileBlocks,
+  isSafeIngestPath,
+  stampGeneratedFrontmatterDates,
+  stampGeneratedLogDate,
+  buildGenerationPrompt,
+  sourceSummaryMediaRefsForExternalMarkdown,
+  buildDeterministicIngestLog,
+  rewriteIngestPathFromTitleForTargetLanguage,
+  canonicalizeSourcesField,
+  isAppManagedAggregatePath,
+  updateBoundedRecentIndexSection,
+  filterTruncatedFileRepairOutput,
+} from "./ingest"
 
 // ── Happy paths ─────────────────────────────────────────────────────
 
@@ -81,6 +94,36 @@ describe("parseFileBlocks — canonical shapes", () => {
   })
 })
 
+describe("source summary media refs", () => {
+  it("rewrites generated media refs so wiki/sources pages work in external Markdown apps", () => {
+    const input = [
+      "![Chart](media/report/001-chart.png)",
+      "![Table](./media/report/table%201.png)",
+      '<img src="media/report/raw.png" />',
+      "![Already relative](../media/report/keep.png)",
+    ].join("\n")
+
+    expect(sourceSummaryMediaRefsForExternalMarkdown(input)).toBe([
+      "![Chart](../media/report/001-chart.png)",
+      "![Table](../media/report/table%201.png)",
+      '<img src="../media/report/raw.png" />',
+      "![Already relative](../media/report/keep.png)",
+    ].join("\n"))
+  })
+})
+
+describe("deterministic ingest log", () => {
+  it("builds a deterministic append-only log entry without another LLM call", () => {
+    expect(buildDeterministicIngestLog("", "raw/sources/a.pdf", "2026-07-20")).toBe(
+      "# Wiki Log\n\n## [2026-07-20] ingest | raw/sources/a.pdf\n",
+    )
+    expect(buildDeterministicIngestLog("# Wiki Log\n", "raw/sources/b.pdf", "2026-07-20")).toBe(
+      "# Wiki Log\n\n## [2026-07-20] ingest | raw/sources/b.pdf\n",
+    )
+  })
+
+})
+
 // ── H1: CRLF normalization ─────────────────────────────────────────
 
 describe("parseFileBlocks — H1: CRLF line endings", () => {
@@ -128,7 +171,7 @@ describe("parseFileBlocks — H2: truncated streams (surface, don't hide)", () =
       "---FILE: wiki/concepts/moe.md---",
       "# Mixture of Exp", // stream cut here
     ].join("\n")
-    const { blocks, warnings } = parseFileBlocks(text)
+    const { blocks, warnings, truncatedPaths } = parseFileBlocks(text)
     // Completed block makes it through.
     expect(blocks).toHaveLength(1)
     expect(blocks[0].path).toBe("wiki/entities/qwen.md")
@@ -136,6 +179,7 @@ describe("parseFileBlocks — H2: truncated streams (surface, don't hide)", () =
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatch(/wiki\/concepts\/moe\.md/)
     expect(warnings[0]).toMatch(/not closed/i)
+    expect(truncatedPaths).toEqual(["wiki/concepts/moe.md"])
   })
 
   it("warns when the only block is unclosed", () => {
@@ -144,6 +188,34 @@ describe("parseFileBlocks — H2: truncated streams (surface, don't hide)", () =
     expect(blocks).toHaveLength(0)
     expect(warnings).toHaveLength(1)
     expect(warnings[0]).toMatch(/rope\.md/)
+  })
+})
+
+describe("filterTruncatedFileRepairOutput", () => {
+  it("keeps one requested block and drops duplicate and unrequested blocks", () => {
+    const requested = "wiki/concepts/recovered.md"
+    const result = filterTruncatedFileRepairOutput([
+      `---FILE: ${requested}---`,
+      "# First complete repair",
+      "---END FILE---",
+      `---FILE: ${requested}---`,
+      "# Duplicate repair",
+      "---END FILE---",
+      "---FILE: wiki/concepts/unrequested.md---",
+      "# Unrequested",
+      "---END FILE---",
+    ].join("\n"), [requested])
+
+    expect(result.paths).toEqual([requested])
+    expect(result.text).toContain("# First complete repair")
+    expect(result.text).not.toContain("# Duplicate repair")
+    expect(result.text).not.toContain("# Unrequested")
+    expect(result.warnings).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/duplicate FILE block/),
+        expect.stringMatching(/unrequested FILE block/),
+      ]),
+    )
   })
 })
 
@@ -468,5 +540,147 @@ describe("parseFileBlocks — path-traversal guard end-to-end", () => {
       "wiki/entities/topic-b.md",
     ])
     expect(warnings.some((w) => w.includes("../config.json"))).toBe(true)
+  })
+})
+
+describe("generated ingest dates", () => {
+  it("stamps frontmatter dates to the application date instead of model guesses", () => {
+    const out = stampGeneratedFrontmatterDates(
+      [
+        "---",
+        "type: concept",
+        "title: Wrong Date",
+        "created: 2024-01-01",
+        "updated: 2025-02-02",
+        "tags: []",
+        "---",
+        "# Body",
+      ].join("\n"),
+      "2026-06-07",
+    )
+
+    expect(out).toContain("created: 2026-06-07")
+    expect(out).toContain("updated: 2026-06-07")
+    expect(out).not.toContain("2024-01-01")
+    expect(out).not.toContain("2025-02-02")
+  })
+
+  it("adds missing frontmatter dates when the model omits them", () => {
+    const out = stampGeneratedFrontmatterDates(
+      [
+        "---",
+        "type: concept",
+        "title: Missing Date",
+        "tags: []",
+        "---",
+        "# Body",
+      ].join("\n"),
+      "2026-06-07",
+    )
+
+    expect(out).toContain("created: 2026-06-07")
+    expect(out).toContain("updated: 2026-06-07")
+  })
+
+  it("stamps generated log headings to the application date", () => {
+    expect(stampGeneratedLogDate("## [2024-01-01] ingest | Foo", "2026-06-07"))
+      .toBe("## [2026-06-07] ingest | Foo")
+    expect(stampGeneratedLogDate("## [YYYY-MM-DD] ingest | Foo", "2026-06-07"))
+      .toBe("## [2026-06-07] ingest | Foo")
+  })
+
+  it("tells the model the exact current date in the generation prompt", () => {
+    const prompt = buildGenerationPrompt("", "", "", "paper.pdf")
+
+    expect(prompt).toContain("Today's date is")
+    expect(prompt).toContain("Use this exact date")
+    expect(prompt).not.toContain("created: 2026-04-29")
+  })
+})
+
+describe("rewriteIngestPathFromTitleForTargetLanguage", () => {
+  it("uses the CJK page title for generated page filenames when the target language is CJK", () => {
+    const content = [
+      "---",
+      "type: concept",
+      "title: 反硝化除磷技术",
+      "created: 2026-06-18",
+      "---",
+      "",
+      "# 反硝化除磷技术",
+      "",
+      "正文。",
+    ].join("\n")
+
+    expect(
+      rewriteIngestPathFromTitleForTargetLanguage(
+        "wiki/concepts/denitrifying-phosphorus-removal.md",
+        content,
+        "Chinese",
+      ),
+    ).toBe("wiki/concepts/反硝化除磷技术.md")
+  })
+
+  it("does not rewrite source summaries or aggregate pages", () => {
+    const content = "---\ntitle: 反硝化除磷技术\n---\n# 反硝化除磷技术"
+
+    expect(
+      rewriteIngestPathFromTitleForTargetLanguage("wiki/sources/source-slug.md", content, "Chinese"),
+    ).toBe("wiki/sources/source-slug.md")
+    expect(
+      rewriteIngestPathFromTitleForTargetLanguage("wiki/index.md", content, "Chinese"),
+    ).toBe("wiki/index.md")
+  })
+})
+
+describe("canonicalizeSourcesField", () => {
+  it("removes generated and unsafe paths while preserving raw source identities", () => {
+    const content = [
+      "---",
+      "title: Entity",
+      'sources: ["wiki/log.md", "wiki/index.md", ".llm-wiki/state.json", "/tmp/secret.md", "../escape.md", "raw/sources/folder/source.md"]',
+      "---",
+      "# Entity",
+    ].join("\n")
+
+    const result = canonicalizeSourcesField(content, "folder/source.md")
+
+    expect(result).toContain('sources: ["folder/source.md"]')
+    expect(result).not.toContain("wiki/log.md")
+    expect(result).not.toContain(".llm-wiki")
+    expect(result).not.toContain("/tmp/secret.md")
+    expect(result).not.toContain("../escape.md")
+  })
+
+  it("preserves a legitimate source identity under a wiki-named raw subfolder", () => {
+    const content = '---\ntitle: Notes\nsources: ["raw/sources/wiki/notes.md"]\n---\n# Notes'
+    expect(canonicalizeSourcesField(content, "wiki/notes.md")).toContain(
+      'sources: ["wiki/notes.md"]',
+    )
+  })
+})
+
+describe("application-managed aggregate boundaries", () => {
+  it("recognizes case and separator variants", () => {
+    expect(isAppManagedAggregatePath("wiki/INDEX.md")).toBe(true)
+    expect(isAppManagedAggregatePath("wiki\\overview.MD")).toBe(true)
+    expect(isAppManagedAggregatePath("wiki/entities/index.md")).toBe(false)
+  })
+
+  it("bounds recent entries and preserves following sections", () => {
+    const existing = [
+      "# Wiki Index",
+      "",
+      "## Recently Updated",
+      ...Array.from({ length: 205 }, (_, index) => `- [[old-${index}]] — Old ${index}`),
+      "",
+      "## Other",
+      "Keep me",
+    ].join("\n")
+    const result = updateBoundedRecentIndexSection(existing, ["- [[new]] — New"])
+    const recent = result.split("## Recently Updated")[1].split("## Other")[0]
+    expect(recent.match(/^- \[\[/gm)).toHaveLength(200)
+    expect(recent).toContain("[[new]]")
+    expect(result).toContain("## Other\nKeep me")
   })
 })

@@ -67,6 +67,76 @@ test("search posts JSON body to current project", async () => {
   assert.equal(results.results[0]?.vectorScore, 0.9)
 })
 
+test("chat posts agent request and parses references", async () => {
+  let url = ""
+  let body = ""
+  const fetchImpl = async (requestUrl: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    url = String(requestUrl)
+    body = String(init?.body ?? "")
+    return new Response(JSON.stringify({
+      ok: true,
+      projectId: "p1",
+      sessionId: "s1",
+      mode: "standard",
+      message: { role: "assistant", content: "answer" },
+      references: [{ title: "A", path: "wiki/a.md", kind: "wiki", snippet: "hit", score: 0.5 }],
+      toolEvents: [{ tool: "wiki.search", status: "completed", detail: "1 result" }],
+      events: [{ type: "toolEnd", tool: "wiki.search" }],
+      usage: { promptChars: 100, completionChars: 6, referenceCount: 1, toolEventCount: 1 },
+    }), { status: 200 })
+  }
+
+  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const response = await client.chat("current", "question", {
+    sessionId: "s1",
+    mode: "standard",
+    topK: 4,
+    includeContent: true,
+    wiki: true,
+    web: false,
+    anytxt: true,
+    skills: ["reviewer"],
+  })
+
+  assert.equal(url, "http://localhost:19828/api/v1/projects/current/chat")
+  assert.deepEqual(JSON.parse(body), {
+    message: "question",
+    sessionId: "s1",
+    mode: "standard",
+    topK: 4,
+    includeContent: true,
+    tools: { wiki: true, web: false, anytxt: true },
+    skills: ["reviewer"],
+  })
+  assert.equal(response.sessionId, "s1")
+  assert.equal(response.message.content, "answer")
+  assert.equal(response.references[0]?.path, "wiki/a.md")
+  assert.equal(response.toolEvents[0]?.tool, "wiki.search")
+  assert.equal(response.events[0]?.type, "toolEnd")
+  assert.equal(response.usage?.promptChars, 100)
+})
+
+test("cancelChat posts to the chat cancellation endpoint", async () => {
+  let url = ""
+  let method = ""
+  const fetchImpl = async (requestUrl: string | URL | Request, init?: RequestInit): Promise<Response> => {
+    url = String(requestUrl)
+    method = String(init?.method ?? "")
+    return new Response(JSON.stringify({
+      ok: true,
+      sessionId: "s1",
+      cancelled: true,
+    }), { status: 200 })
+  }
+
+  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const response = await client.cancelChat("current", "s1")
+
+  assert.equal(url, "http://localhost:19828/api/v1/projects/current/chat/s1/cancel")
+  assert.equal(method, "POST")
+  assert.deepEqual(response, { sessionId: "s1", cancelled: true })
+})
+
 test("graph parses nodeType from API graph nodes", async () => {
   const fetchImpl = async (): Promise<Response> => (
     new Response(JSON.stringify({
@@ -98,6 +168,41 @@ test("files exposes truncated flag", async () => {
 
   assert.equal(files.truncated, true)
   assert.equal(files.files[0]?.path, "wiki/index.md")
+})
+
+test("reviews requests unresolved review items with filters", async () => {
+  const calls: string[] = []
+  const fetchImpl = async (url: string | URL | Request): Promise<Response> => {
+    calls.push(String(url))
+    return new Response(JSON.stringify({
+      ok: true,
+      projectId: "p1",
+      status: "unresolved",
+      count: 1,
+      reviews: [{
+        id: "r1",
+        type: "missing-page",
+        title: "Missing page: Attention",
+        description: "Add the Attention page",
+        options: [],
+        resolved: false,
+        createdAt: 1,
+      }],
+    }), { status: 200 })
+  }
+
+  const client = new LlmWikiApiClient({ baseUrl: "http://localhost:19828", fetchImpl })
+  const result = await client.reviews("current", {
+    status: "unresolved",
+    type: "missing-page",
+    limit: 5,
+  })
+
+  assert.equal(calls[0], "http://localhost:19828/api/v1/projects/current/reviews?status=unresolved&type=missing-page&limit=5")
+  assert.equal(result.status, "unresolved")
+  assert.equal(result.count, 1)
+  assert.equal(result.reviews[0]?.id, "r1")
+  assert.equal(result.reviews[0]?.resolved, false)
 })
 
 test("network failures include desktop app hint", async () => {

@@ -8,8 +8,11 @@ import { useWikiStore } from "@/stores/wiki-store"
 import { readFile, listDirectory } from "@/commands/fs"
 import type { FileNode } from "@/types/wiki"
 import { normalizePath } from "@/lib/path-utils"
+import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
 import { cascadeDeleteWikiPagesWithRefs } from "@/lib/wiki-page-delete"
 import { inferWikiTypeFromPath, wikiTypeLabel } from "@/lib/wiki-page-types"
+import { filterRawSourceTree } from "@/lib/source-filter"
+import { useTranslation } from "react-i18next"
 
 interface WikiPageInfo {
   path: string
@@ -37,12 +40,12 @@ function typeConfig(type: string): { icon: typeof FileText; label: string; color
 }
 
 export function KnowledgeTree() {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const fileTree = useWikiStore((s) => s.fileTree)
-  const setFileTree = useWikiStore((s) => s.setFileTree)
-  const bumpDataVersion = useWikiStore((s) => s.bumpDataVersion)
+  const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
+  const dataVersion = useWikiStore((s) => s.dataVersion)
   const [pages, setPages] = useState<WikiPageInfo[]>([])
   const [expandedTypes, setExpandedTypes] = useState<Set<string>>(new Set(["overview", "entity", "concept", "source"]))
   // Two-stage delete: first click arms the row, second click executes.
@@ -81,10 +84,12 @@ export function KnowledgeTree() {
     }
   }, [project])
 
-  // Reload when file tree changes (after ingest writes new pages)
+  // Reload when wiki data changes. Do not key this off the visible
+  // sidebar file tree: lazy directory expansion mutates that tree and
+  // should not force a full wiki metadata re-parse.
   useEffect(() => {
     loadPages()
-  }, [loadPages, fileTree])
+  }, [loadPages, dataVersion])
 
   const handleDeleteClick = useCallback(
     async (pagePath: string) => {
@@ -102,12 +107,13 @@ export function KnowledgeTree() {
         // Refresh: page list, file tree, any data-version subscribers.
         await loadPages()
         try {
-          const tree = await listDirectory(pp)
-          setFileTree(tree)
+          await refreshProjectFileTree(pp, {
+            projectId: project.id,
+            bumpDataVersion: true,
+          })
         } catch {
           // non-critical
         }
-        bumpDataVersion()
         if (selectedFile === pagePath) setSelectedFile(null)
       } catch (err) {
         console.error("[KnowledgeTree] delete failed:", err)
@@ -116,7 +122,7 @@ export function KnowledgeTree() {
         setDeletingPath(null)
       }
     },
-    [project, armedPath, loadPages, selectedFile, setSelectedFile, setFileTree, bumpDataVersion],
+    [project, armedPath, loadPages, selectedFile, setSelectedFile],
   )
 
   if (!project) {
@@ -161,7 +167,7 @@ export function KnowledgeTree() {
 
         {sortedGroups.length === 0 && (
           <div className="px-2 py-4 text-center text-xs text-muted-foreground">
-            No wiki pages yet. Import sources to get started.
+            {t("sidebar.noWikiPages")}
           </div>
         )}
 
@@ -182,7 +188,9 @@ export function KnowledgeTree() {
                   <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 )}
                 <Icon className={`h-3.5 w-3.5 shrink-0 ${config.color}`} />
-                <span className="flex-1 text-left font-medium">{config.label}</span>
+                <span className="flex-1 text-left font-medium">
+                  {t(`sidebar.typeLabels.${type}`, { defaultValue: config.label })}
+                </span>
                 <span className="text-xs text-muted-foreground">{items.length}</span>
               </button>
 
@@ -200,7 +208,7 @@ export function KnowledgeTree() {
                         }`}
                       >
                         <button
-                          onClick={() => setSelectedFile(page.path)}
+                          onClick={() => openPathInPreview(page.path)}
                           className={`flex flex-1 items-center gap-1.5 px-2 py-1 text-left text-sm min-w-0 ${
                             isSelected
                               ? "text-accent-foreground"
@@ -242,8 +250,9 @@ export function KnowledgeTree() {
 }
 
 function RawSourcesSection() {
+  const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
+  const openPathInPreview = useWikiStore((s) => s.openPathInPreview)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const [expanded, setExpanded] = useState(false)
   const [sources, setSources] = useState<FileNode[]>([])
@@ -251,7 +260,7 @@ function RawSourcesSection() {
   useEffect(() => {
     if (!project) return
     const pp = normalizePath(project.path)
-    listDirectory(`${pp}/raw/sources`)
+    listDirectory(`${pp}/raw/sources`, true).then(filterRawSourceTree)
       .then((tree) => setSources(flattenAllFiles(tree)))
       .catch(() => setSources([]))
   }, [project])
@@ -270,7 +279,7 @@ function RawSourcesSection() {
           <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
         )}
         <BookOpen className="h-3.5 w-3.5 shrink-0 text-amber-600" />
-        <span className="flex-1 text-left font-medium text-muted-foreground">Raw Sources</span>
+        <span className="flex-1 text-left font-medium text-muted-foreground">{t("sidebar.rawSources")}</span>
         <span className="text-xs text-muted-foreground">{sources.length}</span>
       </button>
       {expanded && (
@@ -280,7 +289,7 @@ function RawSourcesSection() {
             return (
               <button
                 key={file.path}
-                onClick={() => setSelectedFile(file.path)}
+                onClick={() => openPathInPreview(file.path)}
                 className={`flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm ${
                   isSelected
                     ? "bg-accent text-accent-foreground"

@@ -4,7 +4,7 @@ import { getProviderConfig, type RequestOverrides } from "./llm-providers"
 import { getHttpFetch, isFetchNetworkError } from "./tauri-fetch"
 import { countReasoningCharsInLine, extractReasoningTextFromLine } from "./reasoning-detector"
 
-export type { ChatMessage, RequestOverrides } from "./llm-providers"
+export type { ChatMessage, ContentBlock, RequestOverrides } from "./llm-providers"
 export { isFetchNetworkError } from "./tauri-fetch"
 
 export interface StreamCallbacks {
@@ -12,6 +12,21 @@ export interface StreamCallbacks {
   onReasoningToken?: (token: string) => void
   onDone: () => void
   onError: (error: Error) => void
+}
+
+function bufferedStreamCallbacks(callbacks: StreamCallbacks): StreamCallbacks {
+  let content = ""
+  let reasoning = ""
+  return {
+    onToken: (token) => { content += token },
+    onReasoningToken: (token) => { reasoning += token },
+    onDone: () => {
+      if (reasoning) callbacks.onReasoningToken?.(reasoning)
+      if (content) callbacks.onToken(content)
+      callbacks.onDone()
+    },
+    onError: callbacks.onError,
+  }
 }
 
 // Lazy import keeps the Tauri event/invoke bindings out of bundles that
@@ -38,13 +53,93 @@ async function streamViaCodexCli(
   return mod.streamCodexCli(config, messages, callbacks, signal, requestOverrides)
 }
 
-const DECODER = new TextDecoder()
-
-function parseLines(chunk: Uint8Array, buffer: string): [string[], string] {
-  const text = buffer + DECODER.decode(chunk, { stream: true })
+function parseLines(
+  decoder: TextDecoder,
+  chunk: Uint8Array,
+  buffer: string,
+): [string[], string] {
+  const text = buffer + decoder.decode(chunk, { stream: true })
   const lines = text.split("\n")
   const remaining = lines.pop() ?? ""
   return [lines, remaining]
+}
+
+interface EndpointErrorEnvelope {
+  error?: {
+    code?: string | number
+    message?: string
+  } | string
+}
+
+function parseEndpointErrorEnvelope(record: string): Error | null {
+  const payload = record.startsWith("data:")
+    ? record.slice(5).trim()
+    : record
+
+  if (!payload.startsWith("{")) return null
+
+  try {
+    const parsed = JSON.parse(payload) as EndpointErrorEnvelope
+    const message = typeof parsed.error === "string"
+      ? parsed.error
+      : parsed.error?.message
+    if (!message) return null
+
+    const code = typeof parsed.error === "object" && parsed.error?.code !== undefined
+      ? ` ${parsed.error.code}`
+      : ""
+    return new Error(`LLM endpoint error${code}: ${message}`)
+  } catch {
+    return null
+  }
+}
+
+function splitFinalStreamRecords(text: string): string[] {
+  // Some local transports expose a fully buffered SSE body with escaped
+  // record separators. Only split after a complete JSON SSE record; a model
+  // response can legitimately contain the text "\n\ndata:", and splitting
+  // that sequence while it is still inside a JSON string would corrupt it.
+  if (/[\r\n]/.test(text) || !/^\s*data:/.test(text)) {
+    return text.split(/\r?\n/)
+  }
+
+  const records: string[] = []
+  const separator = /(?:\\r)?\\n(?:\\r)?\\n(?=data:)/g
+  let recordStart = 0
+  let match: RegExpExecArray | null
+
+  while ((match = separator.exec(text)) !== null) {
+    const candidate = text.slice(recordStart, match.index).trim()
+    const payload = candidate.startsWith("data:")
+      ? candidate.slice(5).trim()
+      : ""
+    let complete = payload === "[DONE]"
+    if (!complete && payload.startsWith("{")) {
+      try {
+        JSON.parse(payload)
+        complete = true
+      } catch {
+        // The separator-like text is inside an incomplete JSON string.
+      }
+    }
+    if (complete) {
+      records.push(candidate)
+      recordStart = match.index + match[0].length
+    }
+  }
+
+  records.push(text.slice(recordStart))
+  return records
+}
+
+function isRequestCancelledError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /^request cancel(?:l)?ed$/i.test(message.trim())
+}
+
+export function isReasoningOnlyResponseError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err)
+  return /^Model produced [\d,]+ characters of reasoning \/ chain-of-thought, but no actual response content\./.test(message)
 }
 
 export async function streamChat(
@@ -68,11 +163,23 @@ export async function streamChat(
   // HTTP. Dispatch before getProviderConfig — that function throws for
   // this provider because it has no URL/headers.
   if (config.provider === "claude-code") {
-    return streamViaClaudeCodeCli(config, messages, callbacks, signal, requestOverrides)
+    return streamViaClaudeCodeCli(
+      config,
+      messages,
+      config.streamingEnabled === false ? bufferedStreamCallbacks(callbacks) : callbacks,
+      signal,
+      requestOverrides,
+    )
   }
 
   if (config.provider === "codex-cli") {
-    return streamViaCodexCli(config, messages, callbacks, signal, requestOverrides)
+    return streamViaCodexCli(
+      config,
+      messages,
+      config.streamingEnabled === false ? bufferedStreamCallbacks(callbacks) : callbacks,
+      signal,
+      requestOverrides,
+    )
   }
 
   const providerConfig = getProviderConfig(config)
@@ -83,7 +190,8 @@ export async function streamChat(
   // almost always a fast network failure (DNS, TLS, 404, refused) that
   // WebKit surfaces as a generic "Load failed". We track whether the
   // backstop actually fired so we can tell the two apart in the error.
-  const timeoutMs = 30 * 60 * 1000 // 30 min — generous backstop for huge-context reasoning models
+  const timeoutMinutes = Math.max(1, Math.min(1440, config.requestTimeoutMinutes ?? 30))
+  const timeoutMs = timeoutMinutes * 60 * 1000
   let combinedSignal = signal
   let timeoutController: AbortController | undefined
   let timeoutFired = false
@@ -119,7 +227,7 @@ export async function streamChat(
       onDone()
       return
     }
-    if (err instanceof Error && err.name === "AbortError") {
+    if ((err instanceof Error && err.name === "AbortError") || isRequestCancelledError(err)) {
       // Backstop timeout aborted the request (we tracked this via
       // timeoutFired); treat it as a real timeout rather than a cancel.
       if (timeoutFired) {
@@ -172,12 +280,47 @@ export async function streamChat(
     return
   }
 
+  if (!providerConfig.streaming) {
+    try {
+      const payload: unknown = await response.json()
+      const content = providerConfig.parseResponse(payload)
+      if (!content) {
+        onError(new Error("Model returned an empty non-streaming response"))
+        return
+      }
+      onToken(content)
+      onDone()
+    } catch (err) {
+      if (timeoutFired) {
+        onError(new Error(`Request timed out after ${Math.round(timeoutMs / 60000)} min. Try a faster model or a smaller context.`))
+        return
+      }
+      if (
+        signal?.aborted ||
+        (err instanceof Error && err.name === "AbortError") ||
+        isRequestCancelledError(err)
+      ) {
+        onDone()
+        return
+      }
+      if (isFetchNetworkError(err)) {
+        onError(new Error("Connection lost while reading the complete response. Try again."))
+        return
+      }
+      onError(err instanceof Error ? err : new Error(String(err)))
+    }
+    return
+  }
+
   if (!response.body) {
     onError(new Error("Response body is null"))
     return
   }
 
   const reader = response.body.getReader()
+  // TextDecoder keeps partial multi-byte state, so it must be scoped to this
+  // response rather than shared across concurrent research requests.
+  const decoder = new TextDecoder()
   let lineBuffer = ""
 
   // Diagnostic counters. Some OpenAI-compatible endpoints stream
@@ -203,32 +346,56 @@ export async function streamChat(
       callbacks.onReasoningToken?.(part)
     }
   }
+  const processRecord = (line: string): Error | null => {
+    const trimmed = line.trim()
+    if (!trimmed) return null
+
+    reasoningCharsObserved += countReasoningCharsInLine(trimmed)
+    recordReasoning(trimmed)
+    const token = providerConfig.parseStream(trimmed)
+    if (token !== null) {
+      recordToken(token)
+      return null
+    }
+    return parseEndpointErrorEnvelope(trimmed)
+  }
+  const stopForEndpointError = async (error: Error) => {
+    // An endpoint can emit an error event without closing its SSE response.
+    // Cancel the body so that the transport does not keep the connection and
+    // its buffers alive after the caller has already received the failure.
+    try {
+      await reader.cancel()
+    } catch {
+      // Preserve the endpoint's actionable error if transport cleanup fails.
+    }
+    onError(error)
+  }
 
   try {
     while (true) {
       const { done, value } = await reader.read()
 
       if (done) {
-        if (lineBuffer.trim()) {
-          const trimmed = lineBuffer.trim()
-          reasoningCharsObserved += countReasoningCharsInLine(trimmed)
-          recordReasoning(trimmed)
-          const token = providerConfig.parseStream(trimmed)
-          if (token !== null) recordToken(token)
+        const finalText = lineBuffer + decoder.decode()
+        for (const line of splitFinalStreamRecords(finalText)) {
+          const endpointError = processRecord(line)
+          if (endpointError) {
+            await stopForEndpointError(endpointError)
+            return
+          }
         }
         break
       }
 
-      const [lines, remaining] = parseLines(value, lineBuffer)
+      const [lines, remaining] = parseLines(decoder, value, lineBuffer)
       lineBuffer = remaining
 
       for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed) continue
-        reasoningCharsObserved += countReasoningCharsInLine(trimmed)
-        recordReasoning(trimmed)
-        const token = providerConfig.parseStream(trimmed)
-        if (token !== null) recordToken(token)
+        const endpointError = processRecord(line)
+        if (endpointError) {
+          await stopForEndpointError(endpointError)
+          return
+        }
       }
     }
 
@@ -256,7 +423,23 @@ export async function streamChat(
 
     onDone()
   } catch (err) {
-    if (err instanceof Error && (err.name === "AbortError" || (signal?.aborted))) {
+    // The abort can reach us two ways: a real AbortError, or — when the
+    // Tauri HTTP plugin tears down the body stream — a bare *string*
+    // "Request cancelled" passed to controller.error(). The latter is not
+    // an Error, so the old `err instanceof Error` guard let it fall through
+    // to the generic branch and surface verbatim. Recognize both shapes.
+    const isAbort =
+      signal?.aborted ||
+      timeoutFired ||
+      (err instanceof Error && err.name === "AbortError") ||
+      isRequestCancelledError(err)
+    if (isAbort) {
+      // Mirror the pre-fetch catch: distinguish our long-horizon backstop
+      // (an actionable timeout) from a user-initiated cancel (silent).
+      if (timeoutFired) {
+        onError(new Error(`Request timed out after ${Math.round(timeoutMs / 60000)} min. Try a faster model or a smaller context.`))
+        return
+      }
       onDone()
       return
     }

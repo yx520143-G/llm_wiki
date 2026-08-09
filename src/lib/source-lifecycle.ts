@@ -5,7 +5,6 @@ import {
   fileExists,
   getFileSize,
   listDirectory,
-  preprocessFile,
   readFile,
   writeFile,
 } from "@/commands/fs"
@@ -13,10 +12,12 @@ import type { WikiProject, FileNode } from "@/types/wiki"
 import type { LlmConfig } from "@/stores/wiki-store"
 import { enqueueBatch } from "@/lib/ingest-queue"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
+import { getTaskLlmConfig } from "@/lib/llm-task-routing"
 import { getFileName, getFileStem, getRelativePath, normalizePath } from "@/lib/path-utils"
 import {
   sourceIdentityForPath,
   sourceReferenceIdentity,
+  sourceSummarySlugFromIdentity,
 } from "@/lib/source-identity"
 import {
   parseFrontmatterArray,
@@ -24,7 +25,7 @@ import {
   writeFrontmatterArray,
   writeSources,
 } from "@/lib/sources-merge"
-import { removeFromIngestCache } from "@/lib/ingest-cache"
+import { moveIngestCacheEntry, removeFromIngestCache } from "@/lib/ingest-cache"
 import { removePageEmbedding } from "@/lib/embedding"
 import {
   buildDeletedKeys,
@@ -34,7 +35,12 @@ import {
 } from "@/lib/wiki-cleanup"
 import { collectAllFilesIncludingDot } from "@/lib/sources-tree-delete"
 import { isPathAllowedBySourceWatch, normalizeSourceWatchConfig } from "@/lib/source-watch-config"
+import { isSensitiveConfigSourceFile } from "@/lib/source-filter"
+import { naturalCompare } from "@/lib/natural-sort"
 import type { SourceWatchConfig } from "@/stores/wiki-store"
+import { useWikiStore } from "@/stores/wiki-store"
+import { preprocessSourceFiles } from "@/lib/source-preprocess"
+import { moveParsedMarkdown, removeParsedMarkdown } from "@/lib/parsed-source-output"
 
 export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
   "md",
@@ -43,8 +49,17 @@ export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
   "pdf",
   "doc",
   "docx",
+  "docm",
+  "ppt",
+  "pps",
+  "pot",
   "pptx",
+  "pptm",
+  "ppsx",
+  "ppsm",
   "xlsx",
+  "xlsm",
+  "xlsb",
   "odt",
   "odp",
   "ods",
@@ -57,6 +72,9 @@ export const INGESTABLE_SOURCE_EXTENSIONS = new Set([
   "xml",
   "yaml",
   "yml",
+  "epub",
+  "mobi",
+  "org",
 ])
 
 function flattenFiles(nodes: FileNode[]): FileNode[] {
@@ -77,6 +95,22 @@ function parentPath(path: string): string {
   return index > 0 ? normalized.slice(0, index) : ""
 }
 
+function stripTrailingSlash(path: string): string {
+  return normalizePath(path).replace(/\/+$/, "")
+}
+
+function isSameOrInside(path: string, parent: string): boolean {
+  const p = stripTrailingSlash(path).toLowerCase()
+  const base = stripTrailingSlash(parent).toLowerCase()
+  return p === base || p.startsWith(`${base}/`)
+}
+
+function isProjectScopedImport(projectPath: string, selectedFolder: string): boolean {
+  const pp = stripTrailingSlash(projectPath)
+  const sourceRoot = stripTrailingSlash(selectedFolder)
+  return isSameOrInside(pp, sourceRoot) || isSameOrInside(sourceRoot, pp)
+}
+
 export interface DeleteSourceResult {
   deletedWikiPaths: string[]
   rewrittenSourcePages: number
@@ -90,6 +124,109 @@ export interface DeleteSourcesResult {
   deletedWikiPaths: string[]
   rewrittenSourcePages: number
   skippedPages: number
+}
+
+/**
+ * Preserve source ownership when a watcher proves that a delete/create pair
+ * is an unchanged file move. The caller must establish content identity from
+ * watcher hashes; this function intentionally does not infer moves by name.
+ */
+export async function migrateSourcePath(
+  projectPath: string,
+  oldSourcePath: string,
+  newSourcePath: string,
+): Promise<number> {
+  const pp = normalizePath(projectPath)
+  const oldIdentity = sourceIdentityForPath(pp, oldSourcePath)
+  const newIdentity = sourceIdentityForPath(pp, newSourcePath)
+  // Cache keys preserve spelling, so case-only renames still require a
+  // migration even on case-insensitive filesystems.
+  if (oldIdentity === newIdentity) return 0
+
+  const allMd = flattenMd(await listDirectory(`${pp}/wiki`))
+  const oldBaseName = getFileName(oldIdentity).toLowerCase()
+  const rawSourceFiles = flattenFiles(await listDirectory(`${pp}/raw/sources`, true))
+  const matchingBasenames = rawSourceFiles.filter(
+    (file) => getFileName(file.path).toLowerCase() === oldBaseName,
+  )
+  // Legacy pages sometimes stored only `config.yaml` for a nested source.
+  // Rewrite that shorthand only when the live source basename is unique.
+  const canMigrateLegacyBasename = oldIdentity.includes("/") && matchingBasenames.length === 1
+  const writes: Array<{ path: string; original: string; migrated: string }> = []
+  for (const file of allMd) {
+    const content = await readFile(file.path)
+    if (!content) continue
+    const sources = parseSources(content)
+    let changed = false
+    const migrated = sources.map((source) => {
+      const normalizedSource = sourceReferenceIdentity(source)
+      const matchesIdentity = normalizedSource.toLowerCase() === oldIdentity.toLowerCase()
+      const matchesUniqueLegacyBasename = canMigrateLegacyBasename &&
+        !normalizedSource.includes("/") &&
+        normalizedSource.toLowerCase() === oldBaseName
+      if (!matchesIdentity && !matchesUniqueLegacyBasename) {
+        return source
+      }
+      changed = true
+      return newIdentity
+    })
+    if (!changed) continue
+    writes.push({
+      path: file.path,
+      original: content,
+      migrated: writeSources(content, Array.from(new Set(migrated))),
+    })
+  }
+
+  const oldSummaryRel = `wiki/sources/${sourceSummarySlugFromIdentity(oldIdentity)}.md`
+  const newSummaryRel = `wiki/sources/${sourceSummarySlugFromIdentity(newIdentity)}.md`
+  const oldSummaryPath = `${pp}/${oldSummaryRel}`
+  const newSummaryPath = `${pp}/${newSummaryRel}`
+  const summaryMoves = new Map<string, string>()
+  const shouldMoveSummary = oldSummaryRel !== newSummaryRel && await fileExists(oldSummaryPath)
+  if (shouldMoveSummary && await fileExists(newSummaryPath)) {
+    throw new Error(`Cannot migrate source summary because destination exists: ${newSummaryRel}`)
+  }
+
+  const completedWrites: typeof writes = []
+  let newSummaryCreated = false
+  try {
+    for (const write of writes) {
+      await writeFile(write.path, write.migrated)
+      completedWrites.push(write)
+    }
+    if (shouldMoveSummary) {
+      const migratedSummary = writes.find((write) => write.path === oldSummaryPath)?.migrated
+        ?? await readFile(oldSummaryPath)
+      await writeFile(newSummaryPath, migratedSummary)
+      newSummaryCreated = true
+      await deleteFile(oldSummaryPath)
+      summaryMoves.set(oldSummaryRel, newSummaryRel)
+    }
+    await moveIngestCacheEntry(pp, oldIdentity, newIdentity, summaryMoves)
+    try {
+      await moveParsedMarkdown(pp, oldSourcePath, newSourcePath)
+    } catch (err) {
+      console.warn("[source-lifecycle] failed to move optional parsed Markdown:", err)
+    }
+    return writes.length
+  } catch (err) {
+    if (newSummaryCreated) {
+      try {
+        await deleteFile(newSummaryPath)
+      } catch {
+        // Best-effort rollback; preserve the original error.
+      }
+    }
+    for (const write of completedWrites.reverse()) {
+      try {
+        await writeFile(write.path, write.original)
+      } catch {
+        // Best-effort rollback; preserve the original error.
+      }
+    }
+    throw err
+  }
 }
 
 export function isIngestableSourcePath(path: string): boolean {
@@ -119,11 +256,18 @@ export async function enqueueSourceIngest(
   project: WikiProject,
   sourcePaths: string[],
   llmConfig: LlmConfig,
-  options: { sourceRoot?: string; rootContext?: string } = {},
+  options: { sourceRoot?: string; rootContext?: string; parsingConcurrency?: number } = {},
 ): Promise<string[]> {
-  if (!hasUsableLlm(llmConfig)) return []
+  // Extraction can be expensive (OCR and Office parsers in particular).
+  // Do not parse a batch that cannot proceed to ingest because no usable
+  // model is configured. Imported source files remain on disk and can be
+  // queued after the user configures a provider.
+  if (!hasUsableLlm(getTaskLlmConfig("ingest", llmConfig))) return []
   const files = sourcePaths
-    .filter(isIngestableSourcePath)
+    .filter((sourcePath) =>
+      isIngestableSourcePath(sourcePath) &&
+      !isSensitiveConfigSourceFile(sourcePath)
+    )
     .map((sourcePath) => ({
       sourcePath,
       folderContext: withRootContext(
@@ -132,6 +276,9 @@ export async function enqueueSourceIngest(
       ),
     }))
   if (files.length === 0) return []
+  const parsingConcurrency = options.parsingConcurrency
+    ?? normalizeSourceWatchConfig(useWikiStore.getState().sourceWatchConfig).parsingConcurrency
+  await preprocessSourceFiles(files.map((file) => file.sourcePath), parsingConcurrency)
   return enqueueBatch(project.id, files)
 }
 
@@ -144,11 +291,20 @@ export async function importSourceFiles(
   const pp = normalizePath(project.path)
   const importedPaths: string[] = []
   const cfg = normalizeSourceWatchConfig(sourceWatchConfig)
+  // Explicit file selection is user intent, so the watcher's allow-list must
+  // not silently reject a newly supported format from an older persisted
+  // configuration. Exclusions and the size ceiling still apply. Folder/watch
+  // imports continue to honor includeExtensions to prevent surprise ingestion.
+  const explicitImportConfig = { ...cfg, includeExtensions: [] }
   const maxBytes = cfg.maxFileSizeMb * 1024 * 1024
 
   for (const sourcePath of sourcePaths) {
     const originalName = getFileName(sourcePath) || "unknown"
-    let allowed = isPathAllowedBySourceWatch(sourcePath, cfg)
+    if (isSensitiveConfigSourceFile(sourcePath)) {
+      continue
+    }
+    let allowed = isIngestableSourcePath(sourcePath)
+      && isPathAllowedBySourceWatch(sourcePath, explicitImportConfig)
     if (allowed) {
       try {
         allowed = await getFileSize(sourcePath) <= maxBytes
@@ -162,13 +318,14 @@ export async function importSourceFiles(
     try {
       await copyFile(sourcePath, destPath)
       importedPaths.push(destPath)
-      preprocessFile(destPath).catch(() => {})
     } catch (err) {
       console.error(`Failed to import ${originalName}:`, err)
     }
   }
 
-  await enqueueSourceIngest(project, importedPaths, llmConfig)
+  await enqueueSourceIngest(project, importedPaths, llmConfig, {
+    parsingConcurrency: cfg.parsingConcurrency,
+  })
 
   return importedPaths
 }
@@ -181,17 +338,27 @@ export async function importSourceFolder(
 ): Promise<string[]> {
   const pp = normalizePath(project.path)
   const sourceRoot = normalizePath(selectedFolder)
+  if (isProjectScopedImport(pp, sourceRoot)) {
+    throw new Error("Cannot import the project folder or a folder inside the current project.")
+  }
   const folderName = getFileName(selectedFolder) || "imported"
   const destDir = `${pp}/raw/sources/${folderName}`
   const cfg = normalizeSourceWatchConfig(sourceWatchConfig)
   const maxBytes = cfg.maxFileSizeMb * 1024 * 1024
   const allowedFiles: string[] = []
-  const sourceFiles = flattenFiles(await listDirectory(selectedFolder))
+  // include hidden: a user importing a folder into raw/sources may
+  // legitimately want dotfolder notes. Config-like files under known
+  // agent/tool config folders are still filtered before copy so API
+  // keys / tool config do not enter ingest.
+  const sourceFiles = flattenFiles(await listDirectory(selectedFolder, true))
 
   for (const file of sourceFiles) {
     const relativeSourcePath = getRelativePath(file.path, sourceRoot)
     const destPath = `${destDir}/${relativeSourcePath}`
     const relPath = `raw/sources/${folderName}/${relativeSourcePath}`
+    if (isSensitiveConfigSourceFile(file.path)) {
+      continue
+    }
     let allowed = isPathAllowedBySourceWatch(relPath, cfg)
     if (allowed) {
       try {
@@ -205,17 +372,21 @@ export async function importSourceFolder(
     if (parent) await createDirectory(parent)
     await copyFile(file.path, destPath)
     allowedFiles.push(destPath)
-    preprocessFile(destPath).catch(() => {})
   }
 
-  if (hasUsableLlm(llmConfig)) {
-    await enqueueSourceIngest(project, allowedFiles, llmConfig, {
+  const naturallyOrderedFiles = [...allowedFiles].sort((a, b) =>
+    naturalCompare(getRelativePath(a, destDir), getRelativePath(b, destDir)),
+  )
+
+  if (hasUsableLlm(getTaskLlmConfig("ingest", llmConfig))) {
+    await enqueueSourceIngest(project, naturallyOrderedFiles, llmConfig, {
       sourceRoot: destDir,
       rootContext: folderName,
+      parsingConcurrency: cfg.parsingConcurrency,
     })
   }
 
-  return allowedFiles
+  return naturallyOrderedFiles
 }
 
 export async function deleteSourceFile(
@@ -263,10 +434,16 @@ export async function deleteSourceFiles(
   }
 
   for (const info of sourceInfos) {
+    await removeParsedMarkdown(pp, info.source)
     try {
       await deleteFile(`${pp}/raw/sources/.cache/${info.fileName}.txt`)
     } catch {
       // cache file may not exist
+    }
+    try {
+      await deleteFile(`${pp}/raw/sources/.cache/${info.fileName}.txt.parser`)
+    } catch {
+      // Version markers exist only for structured-document parser caches.
     }
     for (const cacheKey of new Set([info.identity, info.fileName])) {
       try {
@@ -426,7 +603,7 @@ export async function cleanupDeletedWikiPages(
   }
 }
 
-async function getUniqueDestPath(dir: string, fileName: string): Promise<string> {
+export async function getUniqueDestPath(dir: string, fileName: string): Promise<string> {
   const basePath = `${dir}/${fileName}`
 
   if (!(await fileExists(basePath))) {

@@ -1,9 +1,9 @@
 import { readFile, writeFile } from "@/commands/fs"
 import { autoIngest } from "./ingest"
-import { useWikiStore } from "@/stores/wiki-store"
 import { normalizePath, isAbsolutePath } from "@/lib/path-utils"
 import { getProjectPathById } from "@/lib/project-identity"
 import { hasUsableLlm } from "@/lib/has-usable-llm"
+import { getTaskLlmConfig } from "@/lib/llm-task-routing"
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -15,7 +15,7 @@ export interface IngestTask {
   projectId: string
   sourcePath: string  // relative to project: "raw/sources/folder/file.pdf"
   folderContext: string  // e.g. "AI-Research > papers" or ""
-  status: "pending" | "processing" | "done" | "failed"
+  status: "pending" | "processing" | "done" | "failed" | "cancelled"
   addedAt: number
   error: string | null
   retryCount: number
@@ -25,6 +25,18 @@ export interface IngestTask {
 
 let queue: IngestTask[] = []
 let processing = false
+/** User-controlled pause. When true, processNext stops handing pending
+ *  tasks to the LLM. If a task is in flight, pauseProcessing aborts it
+ *  and returns it to pending so token spend stops promptly. The drain-
+ *  sweep (also an LLM call) is suppressed too, which is intentional.
+ *  In-memory only: not persisted, reset to false on restoreQueue and
+ *  clearQueueState. */
+let paused = false
+/** Pending task IDs loaded from disk on startup/project open. These are
+ *  intentionally not auto-run to avoid surprise LLM/MinerU spend when the
+ *  app opens. New live tasks still run; if a live enqueue touches the same
+ *  source, it promotes that restored task out of this set. */
+let restoredPausedTaskIds = new Set<string>()
 /** UUID of the currently-active project. Used as a stale-context guard
  *  in processNext: if this changes mid-ingest (user switched projects),
  *  the orphaned runner bails instead of writing to the old project. */
@@ -35,6 +47,11 @@ let currentProjectId = ""
 let currentProjectPath = ""
 let currentAbortController: AbortController | null = null
 let lastWrittenFiles: string[] = []  // track files written by current ingest for cleanup
+/** Task runs cancelled while still inside autoIngest. This is separate from
+ * the persisted task status because the user may restart a retained task
+ * before the old run observes its AbortSignal. In that case the old output
+ * must still be discarded before the restarted pending task can run. */
+let cancelledInFlightTaskIds = new Set<string>()
 let completedSinceIdle = 0
 // Track whether any task has been processed since the last drain.
 // Prevents the sweep from running on every idle/no-op call.
@@ -97,6 +114,18 @@ function sameQueuedSourcePath(a: string, b: string): boolean {
   return normalizeSourcePathForQueue(a) === normalizeSourcePathForQueue(b)
 }
 
+function isStructuralWikiPath(filePath: string): boolean {
+  const normalized = normalizePath(filePath)
+  return (
+    normalized.endsWith("/wiki/index.md") ||
+    normalized.endsWith("/wiki/log.md") ||
+    normalized.endsWith("/wiki/overview.md") ||
+    normalized === "wiki/index.md" ||
+    normalized === "wiki/log.md" ||
+    normalized === "wiki/overview.md"
+  )
+}
+
 function upsertQueuedIngestTask(
   projectId: string,
   sourcePath: string,
@@ -106,19 +135,20 @@ function upsertQueuedIngestTask(
     resetQueueAccounting()
   }
   const normalizedSourcePath = normalizeSourcePathForQueue(sourcePath)
-  const pendingOrFailed = queue.find((t) =>
+  const pendingOrStopped = queue.find((t) =>
     t.projectId === projectId &&
-    (t.status === "pending" || t.status === "failed") &&
+    (t.status === "pending" || t.status === "failed" || t.status === "cancelled") &&
     sameQueuedSourcePath(t.sourcePath, normalizedSourcePath)
   )
 
-  if (pendingOrFailed) {
-    pendingOrFailed.sourcePath = normalizedSourcePath
-    pendingOrFailed.folderContext = folderContext || pendingOrFailed.folderContext
-    pendingOrFailed.status = "pending"
-    pendingOrFailed.error = null
-    pendingOrFailed.retryCount = 0
-    return pendingOrFailed.id
+  if (pendingOrStopped) {
+    restoredPausedTaskIds.delete(pendingOrStopped.id)
+    pendingOrStopped.sourcePath = normalizedSourcePath
+    pendingOrStopped.folderContext = folderContext || pendingOrStopped.folderContext
+    pendingOrStopped.status = "pending"
+    pendingOrStopped.error = null
+    pendingOrStopped.retryCount = 0
+    return pendingOrStopped.id
   }
 
   const processingTask = queue.find((t) =>
@@ -168,6 +198,7 @@ export async function cleanupWrittenFiles(
 ): Promise<void> {
   const { cascadeDeleteWikiPage } = await import("@/lib/wiki-page-delete")
   for (const filePath of filePaths) {
+    if (isStructuralWikiPath(filePath)) continue
     const fullPath = isAbsolutePath(filePath)
       ? normalizePath(filePath)
       : `${projectPath}/${filePath}`
@@ -238,11 +269,35 @@ export async function retryTask(taskId: string): Promise<void> {
   if (!task) return
   if (task.projectId !== currentProjectId) return
 
+  restoredPausedTaskIds.delete(task.id)
   task.status = "pending"
   task.error = null
   task.retryCount = 0
   await saveQueue(currentProjectPath)
   processNext(currentProjectId)
+}
+
+/** Requeue selected failed or cancelled tasks in their existing priority order. */
+export async function retryTasks(taskIds: readonly string[]): Promise<number> {
+  if (!currentProjectId) return 0
+  const selected = new Set(taskIds)
+  let requeued = 0
+  for (const task of queue) {
+    if (
+      task.projectId !== currentProjectId ||
+      !selected.has(task.id) ||
+      (task.status !== "failed" && task.status !== "cancelled")
+    ) continue
+    restoredPausedTaskIds.delete(task.id)
+    task.status = "pending"
+    task.error = null
+    task.retryCount = 0
+    requeued += 1
+  }
+  if (requeued === 0) return 0
+  await saveQueue(currentProjectPath)
+  processNext(currentProjectId)
+  return requeued
 }
 
 /**
@@ -255,6 +310,7 @@ export async function retryAllFailedTasks(): Promise<number> {
   let requeued = 0
   for (const task of queue) {
     if (task.projectId !== currentProjectId || task.status !== "failed") continue
+    restoredPausedTaskIds.delete(task.id)
     task.status = "pending"
     task.error = null
     task.retryCount = 0
@@ -268,6 +324,36 @@ export async function retryAllFailedTasks(): Promise<number> {
   return requeued
 }
 
+export async function retryAllStoppedTasks(): Promise<number> {
+  return retryTasks(
+    queue
+      .filter(
+        (task) =>
+          task.projectId === currentProjectId &&
+          (task.status === "failed" || task.status === "cancelled"),
+      )
+      .map((task) => task.id),
+  )
+}
+
+/** Move a pending task one slot in queue priority without crossing active work. */
+export async function movePendingTask(
+  taskId: string,
+  direction: "up" | "down",
+): Promise<boolean> {
+  const pending = queue.filter(
+    (task) => task.projectId === currentProjectId && task.status === "pending",
+  )
+  const position = pending.findIndex((task) => task.id === taskId)
+  const swapPosition = direction === "up" ? position - 1 : position + 1
+  if (position < 0 || swapPosition < 0 || swapPosition >= pending.length) return false
+  const firstIndex = queue.findIndex((task) => task.id === pending[position].id)
+  const secondIndex = queue.findIndex((task) => task.id === pending[swapPosition].id)
+  ;[queue[firstIndex], queue[secondIndex]] = [queue[secondIndex], queue[firstIndex]]
+  await saveQueue(currentProjectPath)
+  return true
+}
+
 /**
  * Cancel a pending or processing task.
  * If processing, aborts the LLM call and cleans up generated files.
@@ -277,7 +363,9 @@ export async function cancelTask(taskId: string): Promise<void> {
   if (!task) return
   if (task.projectId !== currentProjectId) return
 
-  if (task.status === "processing") {
+  const wasProcessing = task.status === "processing"
+  if (wasProcessing) {
+    cancelledInFlightTaskIds.add(task.id)
     // Abort the in-progress LLM call
     if (currentAbortController) {
       currentAbortController.abort()
@@ -291,14 +379,106 @@ export async function cancelTask(taskId: string): Promise<void> {
       lastWrittenFiles = []
     }
 
-    processing = false
   }
 
-  queue = queue.filter((t) => t.id !== taskId)
+  restoredPausedTaskIds.delete(taskId)
+  task.status = "cancelled"
+  task.error = null
+  if (!queue.some((t) => t.status === "pending" || t.status === "processing")) {
+    paused = false
+    clearUsageLimitAutoResume()
+  }
   await saveQueue(currentProjectPath)
-  console.log(`[Ingest Queue] Cancelled: ${task.sourcePath}`)
+  console.log(`[Ingest Queue] Cancelled and retained for restart: ${task.sourcePath}`)
 
-  processNext(currentProjectId)
+  // The in-flight run owns `processing` until it observes cancellation.
+  // Starting another task here would let the old abort handler race it.
+  if (!wasProcessing) processNext(currentProjectId)
+}
+
+/** Cancel selected pending/processing tasks while retaining them for restart. */
+export async function cancelTasks(taskIds: readonly string[]): Promise<number> {
+  const selected = new Set(taskIds)
+  const targets = queue.filter(
+    (task) =>
+      task.projectId === currentProjectId &&
+      selected.has(task.id) &&
+      (task.status === "pending" || task.status === "processing"),
+  )
+  if (targets.length === 0) return 0
+  const hadProcessingTask = targets.some((task) => task.status === "processing")
+  for (const task of targets) {
+    if (task.status === "processing") cancelledInFlightTaskIds.add(task.id)
+  }
+  if (hadProcessingTask && currentAbortController) {
+    currentAbortController.abort()
+    currentAbortController = null
+  }
+  if (hadProcessingTask && lastWrittenFiles.length > 0) {
+    await cleanupWrittenFiles(currentProjectPath, lastWrittenFiles)
+    lastWrittenFiles = []
+  }
+  for (const task of targets) {
+    restoredPausedTaskIds.delete(task.id)
+    task.status = "cancelled"
+    task.error = null
+  }
+  if (!queue.some((task) => task.status === "pending" || task.status === "processing")) {
+    paused = false
+    clearUsageLimitAutoResume()
+  }
+  await saveQueue(currentProjectPath)
+  if (!hadProcessingTask) processNext(currentProjectId)
+  return targets.length
+}
+
+/**
+ * Permanently discard active-project tasks for sources that no longer exist.
+ * Unlike cancelTasks, this does not retain restartable queue entries because
+ * scheduled-import reconciliation has already established that the mirrored
+ * source must be removed.
+ */
+export async function discardTasksForSources(
+  sourcePaths: readonly string[],
+): Promise<number> {
+  const targets = queue.filter(
+    (task) =>
+      task.projectId === currentProjectId &&
+      sourcePaths.some((sourcePath) => {
+        const source = normalizeSourcePathForQueue(sourcePath)
+        const queued = normalizeSourcePathForQueue(task.sourcePath)
+        return (
+          source === queued ||
+          (isAbsolutePath(source) && !isAbsolutePath(queued) && source.endsWith(`/${queued}`)) ||
+          (isAbsolutePath(queued) && !isAbsolutePath(source) && queued.endsWith(`/${source}`))
+        )
+      }),
+  )
+  if (targets.length === 0) return 0
+
+  const targetIds = new Set(targets.map((task) => task.id))
+  const hadProcessingTask = targets.some((task) => task.status === "processing")
+  for (const task of targets) {
+    restoredPausedTaskIds.delete(task.id)
+    if (task.status === "processing") cancelledInFlightTaskIds.add(task.id)
+  }
+  if (hadProcessingTask && currentAbortController) {
+    currentAbortController.abort()
+    currentAbortController = null
+  }
+  if (hadProcessingTask && lastWrittenFiles.length > 0) {
+    await cleanupWrittenFiles(currentProjectPath, lastWrittenFiles)
+    lastWrittenFiles = []
+  }
+
+  queue = queue.filter((task) => !targetIds.has(task.id))
+  if (!queue.some((task) => task.status === "pending" || task.status === "processing")) {
+    paused = false
+    clearUsageLimitAutoResume()
+  }
+  await saveQueue(currentProjectPath)
+  if (!hadProcessingTask) processNext(currentProjectId)
+  return targets.length
 }
 
 /**
@@ -312,30 +492,92 @@ export async function clearCompletedTasks(): Promise<void> {
 /**
  * Cancel everything that's not finished in the active project's queue:
  * aborts the running task (if any), cleans up its partial output, and
- * drops every pending + processing item.
+ * retains every pending + processing item as cancelled so it can be restarted.
  *
  * Failed tasks are retained so the user can still see / retry them.
  * Returns the number of tasks removed from the queue.
  */
 export async function cancelAllTasks(): Promise<number> {
+  const hadProcessingTask = queue.some(
+    (task) => task.projectId === currentProjectId && task.status === "processing",
+  )
+  for (const task of queue) {
+    if (task.projectId === currentProjectId && task.status === "processing") {
+      cancelledInFlightTaskIds.add(task.id)
+    }
+  }
   if (currentAbortController) {
     currentAbortController.abort()
     currentAbortController = null
   }
-  processing = false
 
   if (lastWrittenFiles.length > 0) {
     await cleanupWrittenFiles(currentProjectPath, lastWrittenFiles)
     lastWrittenFiles = []
   }
 
-  const before = queue.length
-  queue = queue.filter((t) => t.status === "failed")
-  const removed = before - queue.length
+  let cancelled = 0
+  for (const task of queue) {
+    if (task.status !== "pending" && task.status !== "processing") continue
+    restoredPausedTaskIds.delete(task.id)
+    task.status = "cancelled"
+    task.error = null
+    cancelled += 1
+  }
+  paused = false
+  clearUsageLimitAutoResume()
+  if (!hadProcessingTask) processing = false
 
   await saveQueue(currentProjectPath)
-  console.log(`[Ingest Queue] Cancelled all: ${removed} tasks removed`)
-  return removed
+  console.log(`[Ingest Queue] Cancelled all and retained: ${cancelled} tasks`)
+  if (!hadProcessingTask) processNext(currentProjectId)
+  return cancelled
+}
+
+/**
+ * Pause queue processing. The currently-running task (if any) is aborted
+ * and returned to pending; no pending tasks are handed to the LLM until
+ * resumeProcessing() is called. Use this to stop token spend without
+ * losing the queue or cancelling work.
+ *
+ * In-memory only: a paused queue auto-resumes on app restart / project
+ * switch (pending tasks are picked up by restoreQueue).
+ */
+export function pauseProcessing(): void {
+  clearUsageLimitAutoResume()
+  paused = true
+  const processingTask = queue.find(
+    (t) => t.projectId === currentProjectId && t.status === "processing",
+  )
+  if (processingTask) {
+    processingTask.status = "pending"
+    if (currentAbortController) {
+      currentAbortController.abort()
+      currentAbortController = null
+    }
+    saveQueue(currentProjectPath).catch((err) => {
+      console.warn("[Ingest Queue] Failed to persist paused queue:", err)
+    })
+  }
+  console.log("[Ingest Queue] Paused — in-flight task aborted; no new tasks will start")
+}
+
+/**
+ * Resume queue processing after pauseProcessing(). Kicks processNext so
+ * pending tasks start immediately. A no-op if a task is already running
+ * (the existing `if (processing) return` guard handles that).
+ */
+export function resumeProcessing(): void {
+  clearUsageLimitAutoResume()
+  paused = false
+  restoredPausedTaskIds.clear()
+  console.log("[Ingest Queue] Resumed")
+  if (currentProjectId) processNext(currentProjectId)
+}
+
+/** Whether queue processing is currently paused by the user. */
+export function isQueuePaused(): boolean {
+  return paused || queue.some((t) => t.status === "pending" && restoredPausedTaskIds.has(t.id))
 }
 
 /**
@@ -348,14 +590,35 @@ export function getQueue(): readonly IngestTask[] {
 /**
  * Get queue summary.
  */
-export function getQueueSummary(): { pending: number; processing: number; failed: number; completed: number; total: number } {
+export function getQueueSummary(): {
+  pending: number
+  processing: number
+  failed: number
+  cancelled: number
+  completed: number
+  total: number
+  paused: boolean
+  userPaused: boolean
+  restoredBacklogWaiting: boolean
+} {
+  const pending = queue.filter((t) => t.status === "pending").length
+  const processingCount = queue.filter((t) => t.status === "processing").length
+  const failed = queue.filter((t) => t.status === "failed").length
+  const cancelled = queue.filter((t) => t.status === "cancelled").length
   const activeTotal = queue.length + completedSinceIdle
+  const restoredBacklogWaiting = queue.some((t) =>
+    t.status === "pending" && restoredPausedTaskIds.has(t.id)
+  )
   return {
-    pending: queue.filter((t) => t.status === "pending").length,
-    processing: queue.filter((t) => t.status === "processing").length,
-    failed: queue.filter((t) => t.status === "failed").length,
+    pending,
+    processing: processingCount,
+    failed,
+    cancelled,
     completed: completedSinceIdle,
     total: activeTotal,
+    paused: paused || (restoredBacklogWaiting && processingCount === 0),
+    userPaused: paused,
+    restoredBacklogWaiting,
   }
 }
 
@@ -366,6 +629,7 @@ export function getQueueSummary(): { pending: number; processing: number; failed
  * disk before clearing memory.
  */
 export function clearQueueState(): void {
+  clearUsageLimitAutoResume()
   if (currentAbortController) {
     currentAbortController.abort()
   }
@@ -373,7 +637,10 @@ export function clearQueueState(): void {
     sweepAbortController.abort()
   }
   queue = []
+  restoredPausedTaskIds.clear()
+  cancelledInFlightTaskIds.clear()
   processing = false
+  paused = false
   currentProjectId = ""
   currentProjectPath = ""
   currentAbortController = null
@@ -393,6 +660,7 @@ export function clearQueueState(): void {
  * Must be `await`ed — the disk flush is async.
  */
 export async function pauseQueue(): Promise<void> {
+  clearUsageLimitAutoResume()
   if (!currentProjectId || !currentProjectPath) {
     // Nothing to pause (no active project)
     return
@@ -422,6 +690,8 @@ export async function pauseQueue(): Promise<void> {
   await saveQueue(pausedProjectPath)
 
   queue = []
+  restoredPausedTaskIds.clear()
+  cancelledInFlightTaskIds.clear()
   currentProjectId = ""
   currentProjectPath = ""
   lastWrittenFiles = []
@@ -432,10 +702,12 @@ export async function pauseQueue(): Promise<void> {
 // ── Restore on startup ───────────────────────────────────────────────────
 
 /**
- * Load queue from disk and resume processing. Called on app startup
- * and when opening / switching to a project. `pauseQueue()` must have
- * been called first (or the active project already cleared) so that
- * in-memory state is not contaminated from the previous project.
+ * Load queue from disk. Called on app startup and when opening / switching
+ * to a project. Restored pending tasks are hydrated but not auto-run; the
+ * user can resume them from the Activity panel. New live enqueues still run.
+ * `pauseQueue()` must have been called first (or the active project already
+ * cleared) so that in-memory state is not contaminated from the previous
+ * project.
  */
 export async function restoreQueue(
   projectId: string,
@@ -445,7 +717,13 @@ export async function restoreQueue(
   // Defensive: reset in-memory state (should already be empty via
   // pauseQueue, but clearing again costs nothing).
   queue = []
+  restoredPausedTaskIds.clear()
+  cancelledInFlightTaskIds.clear()
   processing = false
+  clearUsageLimitAutoResume()
+  // Every project loads un-paused. Pause is a current-session control;
+  // it does not carry across project switches or app restarts.
+  paused = false
   currentAbortController = null
   lastWrittenFiles = []
   resetQueueAccounting()
@@ -475,13 +753,18 @@ export async function restoreQueue(
   }
 
   queue = mine
+  restoredPausedTaskIds = new Set(
+    queue
+      .filter((t) => t.status === "pending")
+      .map((t) => t.id),
+  )
   await saveQueue(pp)
 
   const pending = queue.filter((t) => t.status === "pending").length
   const failed = queue.filter((t) => t.status === "failed").length
 
   if (pending > 0 || restored > 0) {
-    console.log(`[Ingest Queue] Restored: ${pending} pending, ${failed} failed, ${restored} resumed from interrupted`)
+    console.log(`[Ingest Queue] Restored: ${pending} pending paused for manual resume, ${failed} failed, ${restored} reset from interrupted`)
     processNext(projectId)
   }
 }
@@ -489,6 +772,30 @@ export async function restoreQueue(
 // ── Processing ────────────────────────────────────────────────────────────
 
 const MAX_RETRIES = 3
+const USAGE_LIMIT_AUTO_RESUME_MS = 15 * 60 * 1000
+let usageLimitResumeTimer: ReturnType<typeof setTimeout> | null = null
+
+function clearUsageLimitAutoResume(): void {
+  if (usageLimitResumeTimer) {
+    clearTimeout(usageLimitResumeTimer)
+    usageLimitResumeTimer = null
+  }
+}
+
+function isUsageLimitError(message: string): boolean {
+  return /\b429\b|rate[_\s-]*limit|usage\s+limit|quota|too many requests/i.test(message)
+}
+
+function scheduleUsageLimitAutoResume(projectId: string): void {
+  if (usageLimitResumeTimer) return
+  usageLimitResumeTimer = setTimeout(() => {
+    usageLimitResumeTimer = null
+    if (currentProjectId !== projectId) return
+    paused = false
+    console.log("[Ingest Queue] Auto-resuming after provider usage limit pause")
+    processNext(projectId)
+  }, USAGE_LIMIT_AUTO_RESUME_MS)
+}
 
 async function onQueueDrained(projectId: string, projectPath: string): Promise<void> {
   if (!processedSinceDrain) return
@@ -517,9 +824,30 @@ async function processNext(projectId: string): Promise<void> {
   // Stale-context guard: processNext may be invoked by an orphaned
   // recursion from a previous project. If we're no longer active, bail.
   if (currentProjectId !== projectId) return
+  // User pause: don't hand the next pending task to the LLM. Also
+  // skips the drain-sweep below — intended, since that's an LLM call.
+  if (paused) {
+    const hasPending = queue.some((t) => t.projectId === projectId && t.status === "pending")
+    if (hasPending) return
+    // Pause applies to the current queue, not to future imports forever.
+    // If the in-flight task completed despite the abort and nothing is left,
+    // clear it so a later explicit import can run normally.
+    paused = false
+    return
+  }
 
-  const next = queue.find((t) => t.projectId === projectId && t.status === "pending")
+  const next = queue.find((t) =>
+    t.projectId === projectId &&
+    t.status === "pending" &&
+    !restoredPausedTaskIds.has(t.id)
+  )
   if (!next) {
+    const hasRestoredPending = queue.some((t) =>
+      t.projectId === projectId &&
+      t.status === "pending" &&
+      restoredPausedTaskIds.has(t.id)
+    )
+    if (hasRestoredPending) return
     // Queue drained — trigger review cleanup (auto-resolve stale items)
     const pathAtDrain = currentProjectPath
     onQueueDrained(projectId, pathAtDrain).catch((err) =>
@@ -546,11 +874,12 @@ async function processNext(projectId: string): Promise<void> {
   }
 
   processing = true
+  restoredPausedTaskIds.delete(next.id)
   next.status = "processing"
   await saveQueue(pp)
   if (currentProjectId !== projectId) return
 
-  const llmConfig = useWikiStore.getState().llmConfig
+  const llmConfig = getTaskLlmConfig("ingest")
 
   // Check if LLM is configured
   if (!hasUsableLlm(llmConfig)) {
@@ -570,15 +899,40 @@ async function processNext(projectId: string): Promise<void> {
 
   currentAbortController = new AbortController()
   lastWrittenFiles = []
+  const trackWrittenFile = (relativePath: string): void => {
+    if (!lastWrittenFiles.includes(relativePath)) {
+      lastWrittenFiles.push(relativePath)
+    }
+  }
 
   try {
-    const writtenFiles = await autoIngest(pp, fullSourcePath, llmConfig, currentAbortController.signal, next.folderContext)
+    const writtenFiles = await autoIngest(
+      pp,
+      fullSourcePath,
+      llmConfig,
+      currentAbortController.signal,
+      next.folderContext,
+      trackWrittenFile,
+    )
     // Stale-context guard: project switched during the long LLM call.
     // Bail without mutating queue or writing to disk — pauseQueue has
     // already persisted the correct state to the old project's file,
     // and the new project's queue must not be touched by this orphan.
     if (currentProjectId !== projectId) return
     lastWrittenFiles = writtenFiles
+
+    const currentTask = queue.find((task) => task.id === next.id)
+    if (cancelledInFlightTaskIds.delete(next.id) || currentTask?.status === "cancelled") {
+      if (lastWrittenFiles.length > 0) {
+        await cleanupWrittenFiles(pp, lastWrittenFiles)
+        lastWrittenFiles = []
+      }
+      currentAbortController = null
+      processing = false
+      await saveQueue(pp)
+      processNext(projectId)
+      return
+    }
 
     // Safety net: autoIngest resolving with zero files means nothing
     // was really ingested (e.g. abort during webview refresh where the
@@ -591,6 +945,7 @@ async function processNext(projectId: string): Promise<void> {
     // Success: remove from queue
     currentAbortController = null
     lastWrittenFiles = []
+    cancelledInFlightTaskIds.delete(next.id)
     queue = queue.filter((t) => t.id !== next.id)
     completedSinceIdle++
     processedSinceDrain = true
@@ -600,7 +955,41 @@ async function processNext(projectId: string): Promise<void> {
   } catch (err) {
     if (currentProjectId !== projectId) return
     currentAbortController = null
+    const currentTask = queue.find((t) => t.id === next.id)
+    if (cancelledInFlightTaskIds.delete(next.id) || currentTask?.status === "cancelled") {
+      if (lastWrittenFiles.length > 0) {
+        await cleanupWrittenFiles(pp, lastWrittenFiles)
+        lastWrittenFiles = []
+      }
+      processing = false
+      await saveQueue(pp)
+      processNext(projectId)
+      return
+    }
+    if (currentTask?.status === "pending") {
+      if (lastWrittenFiles.length > 0) {
+        await cleanupWrittenFiles(pp, lastWrittenFiles)
+        lastWrittenFiles = []
+      }
+      processing = false
+      await saveQueue(pp)
+      if (!paused) processNext(projectId)
+      return
+    }
     const message = err instanceof Error ? err.message : String(err)
+    if (isUsageLimitError(message)) {
+      next.status = "pending"
+      next.error = `Paused after provider usage limit: ${message}`
+      paused = true
+      processing = false
+      await saveQueue(pp)
+      scheduleUsageLimitAutoResume(projectId)
+      console.log(
+        `[Ingest Queue] Paused after provider usage limit; will retry automatically in ${Math.round(USAGE_LIMIT_AUTO_RESUME_MS / 60000)} minutes: ${message}`,
+      )
+      return
+    }
+
     next.retryCount++
     next.error = message
 

@@ -6,7 +6,7 @@ import rehypeKatex from "rehype-katex"
 import "katex/dist/katex.min.css"
 import {
   Search, Loader2, CheckCircle2, AlertCircle, ChevronRight, ChevronDown, X,
-  FileSearch, FileText, Globe2, Send,
+  FileSearch, FileText, Globe2, Send, RotateCcw,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { useResearchStore, type ResearchTask } from "@/stores/research-store"
@@ -44,6 +44,23 @@ export function ResearchPanel() {
     }
     queueResearch(normalizePath(project.path), topic, llmConfig, searchApiConfig)
     setInputValue("")
+  }
+
+  function handleRetryResearch(task: ResearchTask) {
+    if (!project) return
+    if (!hasConfiguredDeepResearchSources(searchApiConfig)) {
+      window.alert(t("research.notConfigured"))
+      return
+    }
+    queueResearch(
+      normalizePath(project.path),
+      task.topic,
+      llmConfig,
+      searchApiConfig,
+      task.searchQueries,
+      task.sourceReviewId,
+    )
+    removeTask(task.id)
   }
 
   return (
@@ -94,13 +111,18 @@ export function ResearchPanel() {
         ) : (
           <div className="flex flex-col gap-1 p-2">
             {running.map((task) => (
-              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} />
+              <ResearchTaskCard
+                key={task.id}
+                task={task}
+                onRemove={removeTask}
+                onRetry={handleRetryResearch}
+              />
             ))}
             {queued.map((task) => (
-              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} />
+              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} onRetry={handleRetryResearch} />
             ))}
             {done.map((task) => (
-              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} />
+              <ResearchTaskCard key={task.id} task={task} onRemove={removeTask} onRetry={handleRetryResearch} />
             ))}
           </div>
         )}
@@ -123,6 +145,7 @@ function separateThinking(text: string): { thinking: string; answer: string } {
 }
 
 function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStreaming: boolean }) {
+  const { t } = useTranslation()
   const scrollRef = useRef<HTMLDivElement>(null)
   const { thinking, answer } = useMemo(() => separateThinking(synthesis), [synthesis])
   const renderLanguage = useMemo(() => detectLanguage(answer || synthesis), [answer, synthesis])
@@ -146,7 +169,7 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
 
   return (
     <div className="mb-2 flex flex-col min-h-0">
-      <div className="mb-1 font-medium text-muted-foreground">Synthesis</div>
+      <div className="mb-1 font-medium text-muted-foreground">{t("research.synthesis")}</div>
       <div
         ref={scrollRef}
         className="flex-1 overflow-y-auto rounded bg-muted/30 p-2 prose prose-xs prose-invert max-w-none"
@@ -165,7 +188,7 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
               ) : (
                 <ChevronDown className="h-3 w-3" />
               )}
-              Thinking{isStreaming && !answer ? "..." : ""}
+              {t("research.thinking")}{isStreaming && !answer ? "..." : ""}
             </button>
             {!thinkingCollapsed && (
               <div className="mt-1 rounded border border-muted px-2 py-1 text-[10px] text-muted-foreground opacity-70 leading-relaxed whitespace-pre-wrap">
@@ -217,13 +240,20 @@ function SynthesisBlock({ synthesis, isStreaming }: { synthesis: string; isStrea
   )
 }
 
-function ResearchTaskCard({ task, onRemove }: { task: ResearchTask; onRemove: (id: string) => void }) {
+function ResearchTaskCard({
+  task,
+  onRemove,
+  onRetry,
+}: {
+  task: ResearchTask
+  onRemove: (id: string) => void
+  onRetry: (task: ResearchTask) => void
+}) {
   const { t } = useTranslation()
   const [expanded, setExpanded] = useState(
     task.status === "synthesizing" || task.status === "searching"
   )
-  const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const setFileContent = useWikiStore((s) => s.setFileContent)
+  const openFileInPreview = useWikiStore((s) => s.openFileInPreview)
   const project = useWikiStore((s) => s.project)
 
   const statusIcon = {
@@ -249,8 +279,7 @@ function ResearchTaskCard({ task, onRemove }: { task: ResearchTask; onRemove: (i
     const path = `${normalizePath(project.path)}/${task.savedPath}`
     try {
       const content = await readFile(path)
-      setSelectedFile(path)
-      setFileContent(content)
+      openFileInPreview(path, content)
     } catch {
       // ignore
     }
@@ -320,6 +349,17 @@ function ResearchTaskCard({ task, onRemove }: { task: ResearchTask; onRemove: (i
               <Button variant="outline" size="sm" className="h-6 text-[11px] gap-1" onClick={handleOpenSaved}>
                 <FileText className="h-3 w-3" />
                 {t("research.open")}
+              </Button>
+            )}
+            {task.status === "error" && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-6 text-[11px] gap-1"
+                onClick={() => onRetry(task)}
+              >
+                <RotateCcw className="h-3 w-3" />
+                {t("research.retry")}
               </Button>
             )}
             {(task.status === "done" || task.status === "error") && (

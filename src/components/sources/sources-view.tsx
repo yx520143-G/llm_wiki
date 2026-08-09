@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { open } from "@tauri-apps/plugin-dialog"
-import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown } from "lucide-react"
+import { Plus, FileText, RefreshCw, BookOpen, Trash2, Folder, ChevronRight, ChevronDown, Link } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip"
@@ -11,6 +11,7 @@ import { useTranslation } from "react-i18next"
 import { normalizePath } from "@/lib/path-utils"
 import { decideDeleteClick } from "@/lib/sources-tree-delete"
 import { rescanProjectFileSync } from "@/lib/project-file-sync"
+import { naturalCompare } from "@/lib/natural-sort"
 import {
   deleteSourceFile,
   deleteSourceFolder,
@@ -18,17 +19,23 @@ import {
   importSourceFiles,
   importSourceFolder,
 } from "@/lib/source-lifecycle"
+import { filterRawSourceTree } from "@/lib/source-filter"
+import { refreshProjectFileTree } from "@/lib/project-file-tree-refresh"
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog"
+import { importSourceUrls, parseImportUrls, type UrlImportResult } from "@/lib/url-source-import"
+import { listIngestedSourceIdentities } from "@/lib/ingest-cache"
+import { getQueue, type IngestTask } from "@/lib/ingest-queue"
 
 const SOURCE_TREE_INITIAL_ROWS = 160
 const SOURCE_TREE_LOAD_BATCH = 160
+type SourceIngestStatus = "not-ingested" | "ingested" | IngestTask["status"]
 
 export function SourcesView() {
   const { t } = useTranslation()
   const project = useWikiStore((s) => s.project)
   const selectedFile = useWikiStore((s) => s.selectedFile)
   const setSelectedFile = useWikiStore((s) => s.setSelectedFile)
-  const setFileContent = useWikiStore((s) => s.setFileContent)
-  const setFileTree = useWikiStore((s) => s.setFileTree)
+  const openFileInPreview = useWikiStore((s) => s.openFileInPreview)
   const llmConfig = useWikiStore((s) => s.llmConfig)
   const sourceWatchConfig = useWikiStore((s) => s.sourceWatchConfig)
   const dataVersion = useWikiStore((s) => s.dataVersion)
@@ -37,6 +44,12 @@ export function SourcesView() {
   const [ingestingPath, setIngestingPath] = useState<string | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [urlDialogOpen, setUrlDialogOpen] = useState(false)
+  const [urlInput, setUrlInput] = useState("")
+  const [urlError, setUrlError] = useState<string | null>(null)
+  const [urlResults, setUrlResults] = useState<UrlImportResult[]>([])
+  const [ingestedIdentities, setIngestedIdentities] = useState<string[]>([])
+  const [queueSnapshot, setQueueSnapshot] = useState<IngestTask[]>(() => [...getQueue()])
   /**
    * Path of the source-tree node currently in "click again to
    * confirm delete" state. Lifted up here (rather than living
@@ -64,10 +77,8 @@ export function SourcesView() {
     if (!project) return
     const pp = normalizePath(project.path)
     try {
-      const tree = await listDirectory(`${pp}/raw/sources`)
-      // Filter out hidden files/dirs and cache
-      const filtered = filterTree(tree)
-      setSources(filtered)
+      const tree = await listDirectory(`${pp}/raw/sources`, true)
+      setSources(filterRawSourceTree(tree))
       setRefreshError(null)
     } catch (err) {
       setRefreshError(String(err))
@@ -78,6 +89,46 @@ export function SourcesView() {
   useEffect(() => {
     loadSources()
   }, [loadSources, dataVersion])
+
+  useEffect(() => {
+    if (!project) {
+      setIngestedIdentities([])
+      return
+    }
+    let active = true
+    listIngestedSourceIdentities(project.path)
+      .then((identities) => {
+        if (active) setIngestedIdentities(identities)
+      })
+      .catch(() => {
+        if (active) setIngestedIdentities([])
+      })
+    return () => {
+      active = false
+    }
+  }, [project, dataVersion])
+
+  useEffect(() => {
+    const refresh = () => setQueueSnapshot([...getQueue()])
+    refresh()
+    const interval = setInterval(refresh, 1000)
+    return () => clearInterval(interval)
+  }, [project])
+
+  const sourceStatuses = useMemo(() => {
+    const statuses = new Map<string, SourceIngestStatus>()
+    if (!project) return statuses
+    const pp = normalizePath(project.path)
+    for (const identity of ingestedIdentities) {
+      statuses.set(`${pp}/raw/sources/${normalizePath(identity)}`, "ingested")
+    }
+    for (const task of queueSnapshot) {
+      if (task.projectId !== project.id || task.status === "done") continue
+      const path = normalizePath(task.sourcePath)
+      statuses.set(path.startsWith("/") || /^[A-Za-z]:\//.test(path) ? path : `${pp}/${path}`, task.status)
+    }
+    return statuses
+  }, [ingestedIdentities, project, queueSnapshot])
 
   async function handleRefreshSources() {
     if (!project || refreshing) return
@@ -104,10 +155,11 @@ export function SourcesView() {
         {
           name: "Documents",
           extensions: [
-            "md", "mdx", "txt", "rtf", "pdf",
+            "md", "mdx", "txt", "org", "rtf", "pdf",
             "html", "htm", "xml",
-            "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-            "odt", "ods", "odp", "epub", "pages", "numbers", "key",
+            "doc", "docx", "docm", "xls", "xlsx", "xlsm", "xlsb",
+            "ppt", "pps", "pot", "pptx", "pptm", "ppsx", "ppsm",
+            "odt", "ods", "odp", "epub", "mobi", "pages", "numbers", "key",
           ],
         },
         {
@@ -166,11 +218,33 @@ export function SourcesView() {
     }
   }
 
+  async function handleImportUrls() {
+    if (!project || importing) return
+    let urls: string[]
+    try {
+      urls = parseImportUrls(urlInput)
+      if (urls.length === 0) throw new Error(t("sources.urlImport.empty"))
+    } catch (error) {
+      setUrlError(error instanceof Error ? error.message : String(error))
+      return
+    }
+    setImporting(true)
+    setUrlError(null)
+    setUrlResults([])
+    try {
+      const results = await importSourceUrls(project, urls, llmConfig, sourceWatchConfig)
+      setUrlResults(results)
+      await loadSources()
+      if (results.every((result) => result.path && !result.error)) setUrlInput("")
+    } finally {
+      setImporting(false)
+    }
+  }
+
   async function handleOpenSource(node: FileNode) {
-    setSelectedFile(node.path)
     try {
       const content = await readFile(node.path)
-      setFileContent(content)
+      openFileInPreview(node.path, content)
     } catch (err) {
       console.error("Failed to read source:", err)
     }
@@ -188,9 +262,10 @@ export function SourcesView() {
       // Step 8: Refresh everything (UI side — must run with parent
       // context, hence kept here rather than inside the helper).
       await loadSources()
-      const tree = await listDirectory(pp)
-      setFileTree(tree)
-      useWikiStore.getState().bumpDataVersion()
+      await refreshProjectFileTree(pp, {
+        projectId: project.id,
+        bumpDataVersion: true,
+      })
       if (
         selectedFile === node.path ||
         result.deletedWikiPaths.includes(selectedFile ?? "")
@@ -223,9 +298,10 @@ export function SourcesView() {
     try {
       const result = await deleteSourceFolder(pp, folder)
       await loadSources()
-      const tree = await listDirectory(pp)
-      setFileTree(tree)
-      useWikiStore.getState().bumpDataVersion()
+      await refreshProjectFileTree(pp, {
+        projectId: project.id,
+        bumpDataVersion: true,
+      })
       if (
         selectedFile?.startsWith(folder.path + "/") ||
         result.deletedWikiPaths.includes(selectedFile ?? "")
@@ -289,8 +365,51 @@ export function SourcesView() {
             <Plus className="mr-1 h-4 w-4" />
             {t("sources.importFolder", "Folder")}
           </Button>
+          <Button size="sm" onClick={() => setUrlDialogOpen(true)} disabled={importing}>
+            <Link className="mr-1 h-4 w-4" />
+            {t("sources.importUrls")}
+          </Button>
         </div>
       </div>
+
+      <Dialog open={urlDialogOpen} onOpenChange={setUrlDialogOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{t("sources.urlImport.title")}</DialogTitle>
+            <DialogDescription>{t("sources.urlImport.description")}</DialogDescription>
+          </DialogHeader>
+          <textarea
+            className="min-h-44 w-full resize-y rounded-md border bg-background px-3 py-2 font-mono text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            value={urlInput}
+            onChange={(event) => {
+              setUrlInput(event.target.value)
+              setUrlError(null)
+              setUrlResults([])
+            }}
+            placeholder={t("sources.urlImport.placeholder")}
+            disabled={importing}
+          />
+          {urlError && <p className="text-sm text-destructive">{urlError}</p>}
+          {urlResults.length > 0 && (
+            <div className="max-h-40 space-y-1 overflow-auto rounded-md border p-2 text-xs">
+              {urlResults.map((result) => (
+                <div key={result.url} className={result.error ? "text-destructive" : "text-muted-foreground"}>
+                  <span className="break-all">{result.url}</span>
+                  <span className="ml-2">{result.error ?? t("sources.urlImport.imported")}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setUrlDialogOpen(false)} disabled={importing}>
+              {t("common.close")}
+            </Button>
+            <Button onClick={() => void handleImportUrls()} disabled={importing || !urlInput.trim()}>
+              {importing ? t("sources.importing") : t("sources.urlImport.submit")}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <ScrollArea className="min-h-0 flex-1 overflow-hidden">
         {refreshError && (
@@ -327,6 +446,7 @@ export function SourcesView() {
               pendingDeletePath={pendingDeletePath}
               setPendingDeletePath={setPendingDeletePath}
               ingestingPath={ingestingPath}
+              sourceStatuses={sourceStatuses}
             />
           </div>
         )}
@@ -364,18 +484,6 @@ interface SourceTreeRow {
   depth: number
 }
 
-function filterTree(nodes: FileNode[]): FileNode[] {
-  return nodes
-    .filter((n) => !n.name.startsWith("."))
-    .map((n) => {
-      if (n.is_dir && n.children) {
-        return { ...n, children: filterTree(n.children) }
-      }
-      return n
-    })
-    .filter((n) => !n.is_dir || (n.children && n.children.length > 0))
-}
-
 function countFiles(nodes: FileNode[]): number {
   let count = 0
   for (const node of nodes) {
@@ -392,7 +500,7 @@ function sortSourceNodes(nodes: readonly FileNode[]): FileNode[] {
   return [...nodes].sort((a, b) => {
     if (a.is_dir && !b.is_dir) return -1
     if (!a.is_dir && b.is_dir) return 1
-    return a.name.localeCompare(b.name)
+    return naturalCompare(a.name, b.name)
   })
 }
 
@@ -420,6 +528,7 @@ function SourceTree({
   pendingDeletePath,
   setPendingDeletePath,
   ingestingPath,
+  sourceStatuses,
 }: {
   nodes: FileNode[]
   onOpen: (node: FileNode) => void
@@ -433,6 +542,7 @@ function SourceTree({
   pendingDeletePath: string | null
   setPendingDeletePath: (path: string | null) => void
   ingestingPath: string | null
+  sourceStatuses: ReadonlyMap<string, SourceIngestStatus>
 }) {
   const { t } = useTranslation()
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
@@ -491,6 +601,7 @@ function SourceTree({
     <>
       {visibleRows.map(({ node, depth }) => {
         const isPendingDelete = pendingDeletePath === node.path
+        const ingestStatus = sourceStatuses.get(normalizePath(node.path)) ?? "not-ingested"
         if (node.is_dir && node.children) {
           const isCollapsed = collapsed[node.path] ?? false
           return (
@@ -540,13 +651,28 @@ function SourceTree({
             >
               <FileText className="h-4 w-4 shrink-0" />
               <span className="truncate">{node.name}</span>
+              <span
+                className={
+                  ingestStatus === "failed"
+                    ? "shrink-0 text-[10px] text-destructive"
+                    : ingestStatus === "processing"
+                      ? "shrink-0 text-[10px] text-primary"
+                      : "shrink-0 text-[10px] text-muted-foreground"
+                }
+              >
+                {t(`sources.ingestStatus.${ingestStatus}`)}
+              </span>
             </button>
             <Button
               variant="ghost"
               size="icon"
               className="h-7 w-7 shrink-0"
               title={t("sources.ingest")}
-              disabled={ingestingPath === node.path}
+              disabled={
+                ingestingPath === node.path ||
+                ingestStatus === "pending" ||
+                ingestStatus === "processing"
+              }
               onClick={() => onIngest(node)}
             >
               <BookOpen className="h-4 w-4" />

@@ -19,6 +19,7 @@ export interface SettingsDraft {
   maxContextSize: number
   apiMode: CustomApiMode | undefined
   reasoning: ReasoningConfig | undefined
+  ingestReasoning: ReasoningConfig | undefined
   localCliIsolation: boolean
 
   // Embedding
@@ -62,6 +63,7 @@ export interface SettingsDraft {
   proxyEnabled: boolean
   proxyUrl: string
   proxyBypassLocal: boolean
+  proxyAcceptInvalidCerts: boolean
 
   // Scheduled Import
   scheduledImportEnabled: boolean
@@ -79,11 +81,13 @@ export interface SettingsDraft {
 
   // Source folder auto watch
   sourceWatchConfig: SourceWatchConfig
+  sourceWatchAllProjects: boolean
 
   // MinerU PDF parsing
   mineruEnabled: boolean
   mineruBackend: "cloud" | "local"
   mineruLocalEndpoint: string
+  mineruLocalToken: string
   mineruLocalBackend: MineruLocalBackend
   mineruLocalEffort: MineruEffort
   mineruLocalParseMethod: MineruParseMethod

@@ -12,17 +12,38 @@ describe("source watch config", () => {
       expect(DEFAULT_SOURCE_WATCH_CONFIG.includeExtensions).toContain(extension)
     }
   })
+  it("includes standalone image sources in the default watch set", () => {
+    for (const extension of ["png", "jpg", "jpeg"]) {
+      expect(DEFAULT_SOURCE_WATCH_CONFIG.includeExtensions).toContain(extension)
+    }
+  })
+
+  it("upgrades the previous default extension set without changing custom lists", () => {
+    const previousDefaults = DEFAULT_SOURCE_WATCH_CONFIG.includeExtensions.filter(
+      (extension) => !["png", "jpg", "jpeg"].includes(extension),
+    )
+    expect(normalizeSourceWatchConfig({ includeExtensions: previousDefaults }).includeExtensions)
+      .toEqual([...previousDefaults, "png", "jpg", "jpeg"])
+    expect(normalizeSourceWatchConfig({ includeExtensions: ["md", "pdf"] }).includeExtensions)
+      .toEqual(["md", "pdf"])
+  })
   it("uses the shared default fixture", () => {
     expect(DEFAULT_SOURCE_WATCH_CONFIG).toEqual(sourceWatchDefaults)
     expect(normalizeSourceWatchConfig({}).persistExtractedMarkdown).toBe(false)
     expect(normalizeSourceWatchConfig({}).parsingConcurrency).toBe(2)
+    expect(normalizeSourceWatchConfig({}).ingestConcurrency).toBe(1)
     expect(
       normalizeSourceWatchConfig({ persistExtractedMarkdown: true }).persistExtractedMarkdown,
     ).toBe(true)
-    expect(normalizeSourceWatchConfig({ parsingConcurrency: 20 }).parsingConcurrency).toBe(8)
+    expect(normalizeSourceWatchConfig({ parsingConcurrency: 100 }).parsingConcurrency).toBe(64)
+    expect(normalizeSourceWatchConfig({ ingestConcurrency: 100 }).ingestConcurrency).toBe(64)
+    expect(normalizeSourceWatchConfig({ ingestConcurrency: 0 }).ingestConcurrency).toBe(1)
     expect(
       normalizeSourceWatchConfig({ parsingConcurrency: Number.NaN }).parsingConcurrency,
     ).toBe(2)
+    expect(
+      normalizeSourceWatchConfig({ ingestConcurrency: Number.NaN }).ingestConcurrency,
+    ).toBe(1)
   })
 
   it("allows document types by default and rejects config/media/binaries", () => {

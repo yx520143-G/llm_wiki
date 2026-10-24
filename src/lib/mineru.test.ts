@@ -350,6 +350,112 @@ describe("MinerU API helpers", () => {
 })
 
 describe("parseWithMineru", () => {
+  it("uses the MinerU 4 V1 upload, job, and ZIP artifact flow", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response("not found", { status: 404 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.10" }))
+      .mockResolvedValueOnce(jsonResponse({
+        id: "upload-1",
+        status: "completed",
+        file: { id: "source-file-1" },
+      }))
+      .mockResolvedValueOnce(jsonResponse({
+        job_id: "job-1",
+        status: "completed",
+        files: [{
+          name: "report.pdf",
+          status: "completed",
+          output_files: { zip: { file_id: "zip-file-1" } },
+        }],
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "# Parsed with V1" }))
+
+    await expect(parseWithMineru({
+      enabled: true,
+      backend: "local",
+      localBackend: "hybrid-engine",
+      localEffort: "medium",
+      token: "",
+      modelVersion: "vlm",
+    }, "/tmp/report.pdf")).resolves.toBe("# Parsed with V1")
+
+    expect(mockHttpFetch.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8000/health",
+      "http://127.0.0.1:8000/v1/health",
+      "http://127.0.0.1:8000/v1/uploads",
+      "http://127.0.0.1:8000/v1/parse/jobs",
+      "http://127.0.0.1:8000/v1/files/zip-file-1/content",
+    ])
+    const jobBody = JSON.parse(String(mockHttpFetch.mock.calls[3]?.[1]?.body))
+    expect(jobBody).toMatchObject({ tier: "standard", output_formats: ["zip"] })
+  })
+
+  it("does not leak the local API token to a cross-origin V1 upload URL", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response("not found", { status: 404 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }))
+      .mockResolvedValueOnce(jsonResponse({
+        id: "upload-1",
+        status: "pending",
+        upload_url: "https://objects.example/upload-1",
+        upload_method: "PUT",
+        upload_headers: { "X-Upload-Token": "signed" },
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "completed", file: { id: "source-1" } }))
+      .mockResolvedValueOnce(jsonResponse({
+        job_id: "job-1",
+        status: "completed",
+        files: [{ status: "completed", output_files: { zip: { file_id: "zip-1" } } }],
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "parsed" }))
+
+    await parseWithMineru({
+      enabled: true,
+      backend: "local",
+      localToken: "local-secret",
+      localBackend: "hybrid-engine",
+      token: "",
+      modelVersion: "vlm",
+    }, "/tmp/report.pdf")
+
+    expect(mockHttpFetch.mock.calls[3]?.[0]).toBe("https://objects.example/upload-1")
+    expect(mockHttpFetch.mock.calls[3]?.[1]?.headers).toEqual({ "X-Upload-Token": "signed" })
+  })
+
+  it("resolves relative V1 upload URLs below the V1 API base", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response("not found", { status: 404 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok" }))
+      .mockResolvedValueOnce(jsonResponse({
+        id: "upload-1",
+        status: "pending",
+        upload_url: "uploads/upload-1/content",
+        upload_method: "PUT",
+      }))
+      .mockResolvedValueOnce(new Response(null, { status: 200 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "completed", file: { id: "source-1" } }))
+      .mockResolvedValueOnce(jsonResponse({
+        job_id: "job-1",
+        status: "completed",
+        files: [{ status: "completed", output_files: { zip: { file_id: "zip-1" } } }],
+      }))
+      .mockResolvedValueOnce(await zipResponse({ "full.md": "parsed" }))
+
+    await parseWithMineru({
+      enabled: true,
+      backend: "local",
+      localToken: "local-secret",
+      localBackend: "hybrid-engine",
+      token: "",
+      modelVersion: "vlm",
+    }, "/tmp/report.pdf")
+
+    expect(mockHttpFetch.mock.calls[3]?.[0]).toBe(
+      "http://127.0.0.1:8000/v1/uploads/upload-1/content",
+    )
+  })
+
   it("submits a Windows-path PDF and pipeline mode to a custom local endpoint", async () => {
     mockHttpFetch
       .mockResolvedValueOnce(jsonResponse({
@@ -366,6 +472,7 @@ describe("parseWithMineru", () => {
       enabled: true,
       backend: "local",
       localEndpoint: "http://localhost:9000/custom/",
+      localToken: "local-secret",
       localBackend: "pipeline",
       token: "",
       modelVersion: "pipeline",
@@ -378,6 +485,35 @@ describe("parseWithMineru", () => {
     expect(mockHttpFetch.mock.calls[0]?.[0]).toBe("http://localhost:9000/custom/tasks")
     expect(mockHttpFetch.mock.calls[1]?.[0]).toContain("/tasks/task%2F1")
     expect(mockHttpFetch.mock.calls[2]?.[0]).toContain("/tasks/task%2F1/result")
+    for (const call of mockHttpFetch.mock.calls) {
+      expect(call[1]?.headers).toEqual({ Authorization: "Bearer local-secret" })
+      expect(call[1]).toMatchObject({ redirect: "manual", maxRedirections: 0 })
+    }
+  })
+
+  it.each([
+    ["2.1.11", "hybrid-engine"],
+    ["3.1.15", "hybrid-auto-engine"],
+    ["3.4.4", "hybrid-engine"],
+  ])("submits the backend name supported by MinerU %s", async (version, expectedBackend) => {
+    mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({ status: "healthy", version }))
+      .mockResolvedValueOnce(jsonResponse({ task_id: "task-1" }, { status: 202 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "completed" }))
+      .mockResolvedValueOnce(jsonResponse({
+        results: { report: { md_content: "# Parsed locally" } },
+      }))
+
+    await expect(parseWithMineru({
+      enabled: true,
+      backend: "local",
+      localBackend: "hybrid-engine",
+      token: "",
+      modelVersion: "vlm",
+    }, "/tmp/report.pdf")).resolves.toBe("# Parsed locally")
+
+    const form = mockHttpFetch.mock.calls[1]?.[1]?.body as FormData
+    expect(form.get("backend")).toBe(expectedBackend)
   })
 
   it("rejects oversized local-backend files before reading or uploading", async () => {
@@ -396,6 +532,7 @@ describe("parseWithMineru", () => {
 
   it("rejects an empty local-backend result instead of caching it as success", async () => {
     mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({ status: "healthy", version: "3.1.15" }))
       .mockResolvedValueOnce(jsonResponse({ task_id: "task-1" }, { status: 202 }))
       .mockResolvedValueOnce(jsonResponse({ status: "completed" }))
       .mockResolvedValueOnce(jsonResponse({ results: { doc: { md_content: "  " } } }))
@@ -410,6 +547,7 @@ describe("parseWithMineru", () => {
 
   it("saves and rewrites images returned by the official local API", async () => {
     mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({ status: "healthy", version: "3.1.15" }))
       .mockResolvedValueOnce(jsonResponse({ task_id: "task-1" }, { status: 202 }))
       .mockResolvedValueOnce(jsonResponse({ status: "completed" }))
       .mockResolvedValueOnce(jsonResponse({
@@ -438,12 +576,13 @@ describe("parseWithMineru", () => {
       "/project/wiki/media/doc/mineru/images/image-1.png",
       btoa("image bytes"),
     )
-    const form = mockHttpFetch.mock.calls[0]?.[1]?.body as FormData
+    const form = mockHttpFetch.mock.calls[1]?.[1]?.body as FormData
     expect(form.get("return_images")).toBe("true")
   })
 
   it("uses the data URI MIME type when the MinerU filename extension disagrees", async () => {
     mockHttpFetch
+      .mockResolvedValueOnce(jsonResponse({ status: "healthy", version: "3.1.15" }))
       .mockResolvedValueOnce(jsonResponse({ task_id: "task-1" }, { status: 202 }))
       .mockResolvedValueOnce(jsonResponse({ status: "completed" }))
       .mockResolvedValueOnce(jsonResponse({
@@ -789,10 +928,40 @@ describe("testMineruConnection", () => {
   it("checks local health without requiring a cloud token", async () => {
     mockHttpFetch.mockResolvedValueOnce(jsonResponse({ status: "healthy" }))
 
-    await expect(testMineruConnection("", { backend: "local" })).resolves.toBeUndefined()
+    await expect(testMineruConnection("", {
+      backend: "local",
+      localToken: "health-secret",
+    })).resolves.toBeUndefined()
     expect(mockHttpFetch).toHaveBeenCalledWith(
       "http://127.0.0.1:8000/health",
+      expect.objectContaining({
+        headers: { Authorization: "Bearer health-secret" },
+        redirect: "manual",
+        maxRedirections: 0,
+      }),
     )
+  })
+
+  it("falls back to the MinerU 4 V1 health endpoint", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response("not found", { status: 404 }))
+      .mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.10" }))
+
+    await expect(testMineruConnection("", { backend: "local" })).resolves.toBeUndefined()
+    expect(mockHttpFetch.mock.calls.map(([url]) => url)).toEqual([
+      "http://127.0.0.1:8000/health",
+      "http://127.0.0.1:8000/v1/health",
+    ])
+  })
+
+  it("accepts a configured endpoint that already ends in /v1", async () => {
+    mockHttpFetch.mockResolvedValueOnce(jsonResponse({ status: "ok", version: "4.0.10" }))
+    await expect(testMineruConnection("", {
+      backend: "local",
+      localEndpoint: "http://127.0.0.1:8000/v1/",
+    })).resolves.toBeUndefined()
+    expect(mockHttpFetch).toHaveBeenCalledTimes(1)
+    expect(mockHttpFetch.mock.calls[0]?.[0]).toBe("http://127.0.0.1:8000/v1/health")
   })
 
   it("rejects a 200 response that is not a healthy official MinerU service", async () => {

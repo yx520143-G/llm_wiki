@@ -3,6 +3,7 @@
   "autoIngest": true,
   "persistExtractedMarkdown": false,
   "parsingConcurrency": 2,
+  "ingestConcurrency": 1,
   "includeExtensions": [
     "md",
     "mdx",
@@ -29,7 +30,10 @@
     "rtf",
     "html",
     "htm",
-    "csv"
+    "csv",
+    "png",
+    "jpg",
+    "jpeg"
   ],
   "excludeExtensions": [
     "tmp",

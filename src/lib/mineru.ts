@@ -92,12 +92,47 @@ function localMineruApiBase(endpoint: string | undefined): string {
   return candidate.replace(/\/+$/, "")
 }
 
+function localMineruV1Base(endpoint: string | undefined): string {
+  const base = localMineruApiBase(endpoint)
+  return /\/v1$/i.test(base) ? base : `${base}/v1`
+}
+
 // ── API calls ──
 
 async function mineruHeaders(token: string): Promise<HeadersInit> {
   return {
     "Content-Type": "application/json",
     Authorization: `Bearer ${token}`,
+  }
+}
+
+function localMineruHeaders(token: string | undefined): HeadersInit | undefined {
+  const value = token?.trim()
+  return value ? { Authorization: `Bearer ${value}` } : undefined
+}
+
+type TauriRequestInit = RequestInit & { maxRedirections?: number }
+
+function localMineruRequestInit(
+  token: string | undefined,
+  init: RequestInit = {},
+): TauriRequestInit {
+  return {
+    ...init,
+    headers: { ...localMineruHeaders(token), ...init.headers },
+    // plugin-http uses maxRedirections while browser fetch uses redirect.
+    // Set both so credentials never follow an untrusted service redirect.
+    redirect: "manual",
+    maxRedirections: 0,
+  }
+}
+
+
+function sameOrigin(left: string, right: string): boolean {
+  try {
+    return new URL(left).origin === new URL(right).origin
+  } catch {
+    return false
   }
 }
 
@@ -608,6 +643,15 @@ async function downloadAndExtractMarkdown(
   const res = await httpFetch(zipUrl, { signal })
   if (!res.ok) throw new Error(`MinerU zip download failed: HTTP ${res.status}`)
 
+  return extractMarkdownFromZipResponse(res, signal, assetOptions)
+}
+
+async function extractMarkdownFromZipResponse(
+  res: Response,
+  signal?: AbortSignal,
+  assetOptions?: MineruAssetOptions,
+): Promise<MineruExtractedMarkdown> {
+
   const buffer = await res.arrayBuffer()
   const zip = await JSZip.loadAsync(buffer)
 
@@ -652,6 +696,162 @@ async function downloadAndExtractMarkdown(
 
 // ── Local backend ──
 
+const MINERU_3_0_TO_3_2_BACKENDS: Partial<
+  Record<NonNullable<MineruConfig["localBackend"]>, string>
+> = {
+  "vlm-engine": "vlm-auto-engine",
+  "hybrid-engine": "hybrid-auto-engine",
+}
+
+function localMineruBackendForVersion(
+  backend: NonNullable<MineruConfig["localBackend"]>,
+  version: unknown,
+): string {
+  if (typeof version === "string" && /^3\.[0-2](?:\.|$)/.test(version.trim())) {
+    return MINERU_3_0_TO_3_2_BACKENDS[backend] ?? backend
+  }
+  return backend
+}
+
+function localMineruV1Tier(effort: MineruConfig["localEffort"]): string {
+  if (effort === "high") return "advanced"
+  return "standard"
+}
+
+async function fetchLocalMineruV1Artifact(
+  apiBase: string,
+  token: string | undefined,
+  fileId: string,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const httpFetch = await getHttpFetch()
+  const url = `${apiBase}/files/${encodeURIComponent(fileId)}/content`
+  const response = await httpFetch(url, localMineruRequestInit(token, { signal }))
+  if (![301, 302, 303, 307, 308].includes(response.status)) return response
+  const location = response.headers.get("location")
+  if (!location) throw new Error("Local MinerU artifact redirect has no Location header")
+  const target = new URL(location, url).toString()
+  return httpFetch(target, {
+    signal,
+    redirect: "follow",
+    ...(sameOrigin(url, target) ? { headers: localMineruHeaders(token) } : {}),
+  })
+}
+
+async function parseWithLocalMineruV1(
+  config: MineruConfig,
+  fileName: string,
+  bytes: Uint8Array,
+  onProgress?: (msg: string) => void,
+  signal?: AbortSignal,
+  assetOptions?: MineruAssetOptions,
+): Promise<MineruExtractedMarkdown> {
+  const httpFetch = await getHttpFetch()
+  const apiBase = localMineruV1Base(config.localEndpoint)
+  const createRes = await httpFetch(`${apiBase}/uploads`, localMineruRequestInit(config.localToken, {
+    method: "POST",
+    signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      filename: fileName,
+      bytes: bytes.byteLength,
+      mime_type: "application/pdf",
+      purpose: "parse",
+      sha256sum: await sha256OfBytes(bytes),
+    }),
+  }))
+  if (!createRes.ok) throw new Error(`Local MinerU V1 upload creation failed: HTTP ${createRes.status}`)
+  let upload = await createRes.json() as {
+    id?: unknown
+    status?: unknown
+    upload_url?: unknown
+    upload_method?: unknown
+    upload_headers?: unknown
+    file?: { id?: unknown }
+  }
+  const uploadId = typeof upload.id === "string" ? upload.id : ""
+  let fileId = typeof upload.file?.id === "string" ? upload.file.id : ""
+  if (upload.status === "pending") {
+    if (!uploadId || typeof upload.upload_url !== "string") {
+      throw new Error("Local MinerU V1 returned an invalid upload session")
+    }
+    const uploadUrl = new URL(upload.upload_url, `${apiBase}/`).toString()
+    const returnedHeaders = upload.upload_headers && typeof upload.upload_headers === "object"
+      ? Object.fromEntries(Object.entries(upload.upload_headers).filter((entry): entry is [string, string] => typeof entry[1] === "string"))
+      : {}
+    const uploadHeaders = sameOrigin(apiBase, uploadUrl)
+      ? { ...localMineruHeaders(config.localToken), ...returnedHeaders }
+      : returnedHeaders
+    onProgress?.("Uploading to local MinerU V1...")
+    const bytesRes = await httpFetch(uploadUrl, {
+      method: typeof upload.upload_method === "string" ? upload.upload_method : "PUT",
+      headers: uploadHeaders,
+      body: bytesToUploadBody(bytes),
+      signal,
+      redirect: "manual",
+      maxRedirections: 0,
+    } as TauriRequestInit)
+    if (!bytesRes.ok) throw new Error(`Local MinerU V1 byte upload failed: HTTP ${bytesRes.status}`)
+    const completeRes = await httpFetch(
+      `${apiBase}/uploads/${encodeURIComponent(uploadId)}/complete`,
+      localMineruRequestInit(config.localToken, { method: "POST", signal }),
+    )
+    if (!completeRes.ok) throw new Error(`Local MinerU V1 upload completion failed: HTTP ${completeRes.status}`)
+    upload = await completeRes.json()
+    fileId = typeof upload.file?.id === "string" ? upload.file.id : ""
+  }
+  if (!fileId) throw new Error("Local MinerU V1 returned no file ID")
+
+  const jobRes = await httpFetch(`${apiBase}/parse/jobs`, localMineruRequestInit(config.localToken, {
+    method: "POST",
+    signal,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      files: [{ source: { type: "file_id", file_id: fileId } }],
+      tier: localMineruV1Tier(config.localEffort),
+      output_formats: ["zip"],
+    }),
+  }))
+  if (!jobRes.ok) throw new Error(`Local MinerU V1 job creation failed: HTTP ${jobRes.status}`)
+  let job = await jobRes.json() as Record<string, unknown>
+  const jobId = typeof job.job_id === "string" ? job.job_id : ""
+  if (!jobId) throw new Error("Local MinerU V1 returned no job ID")
+
+  onProgress?.("Waiting for local MinerU V1 to finish...")
+  const start = Date.now()
+  while (Date.now() - start < LOCAL_POLL_TIMEOUT_MS) {
+    throwIfAborted(signal)
+    const status = job.status
+    if (status === "completed" || status === "partial") {
+      const files = Array.isArray(job.files) ? job.files : []
+      const parsed = files.find((file): file is Record<string, unknown> =>
+        Boolean(file && typeof file === "object" && (file as Record<string, unknown>).status === "completed"))
+      const outputFiles = parsed?.output_files
+      const zip = outputFiles && typeof outputFiles === "object"
+        ? (outputFiles as Record<string, unknown>).zip
+        : undefined
+      const artifactId = zip && typeof zip === "object" && typeof (zip as Record<string, unknown>).file_id === "string"
+        ? (zip as Record<string, unknown>).file_id as string
+        : ""
+      if (!artifactId) throw new Error("Local MinerU V1 completed without a ZIP artifact")
+      const artifact = await fetchLocalMineruV1Artifact(apiBase, config.localToken, artifactId, signal)
+      if (!artifact.ok) throw new Error(`Local MinerU V1 artifact download failed: HTTP ${artifact.status}`)
+      return extractMarkdownFromZipResponse(artifact, signal, assetOptions)
+    }
+    if (status === "failed" || status === "canceled") {
+      throw new Error(`Local MinerU V1 parsing ${status}`)
+    }
+    await waitForPollInterval(signal)
+    const poll = await httpFetch(
+      `${apiBase}/parse/jobs/${encodeURIComponent(jobId)}`,
+      localMineruRequestInit(config.localToken, { signal }),
+    )
+    if (!poll.ok) throw new Error(`Local MinerU V1 status check failed: HTTP ${poll.status}`)
+    job = await poll.json()
+  }
+  throw new Error("Local MinerU V1 parsing timed out")
+}
+
 /**
  * Parse a document through the official `mineru-api` asynchronous protocol.
  * Files are submitted as multipart/form-data to `/tasks`; the task status and
@@ -667,7 +867,8 @@ async function parseWithLocalMineru(
 ): Promise<MineruExtractedMarkdown> {
   const httpFetch = await getHttpFetch()
   const apiBase = localMineruApiBase(config.localEndpoint)
-  if (config.localBackend?.endsWith("http-client") && !config.localServerUrl?.trim()) {
+  const configuredBackend = config.localBackend || "hybrid-engine"
+  if (configuredBackend.endsWith("http-client") && !config.localServerUrl?.trim()) {
     throw new Error("MinerU HTTP client backends require a model server URL")
   }
   const fileSize = await getFileSize(sourcePath)
@@ -675,8 +876,38 @@ async function parseWithLocalMineru(
     throw new Error("MinerU accurate parsing supports files up to 200 MB")
   }
   throwIfAborted(signal)
+  let serverVersion: unknown
+  let useV1 = false
+  if (configuredBackend.endsWith("-engine")) {
+    try {
+      const healthRes = await httpFetch(
+        `${apiBase}/health`,
+        localMineruRequestInit(config.localToken, { signal }),
+      )
+      if (healthRes.ok) {
+        const health = await healthRes.json() as { status?: unknown; version?: unknown }
+        serverVersion = health.version
+        useV1 = health.status === "ok"
+      } else {
+        const v1Health = await httpFetch(
+          `${localMineruV1Base(config.localEndpoint)}/health`,
+          localMineruRequestInit(config.localToken, { signal }),
+        )
+        if (v1Health.ok) {
+          const health = await v1Health.json().catch(() => null) as { status?: unknown } | null
+          useV1 = health?.status === "ok"
+        }
+      }
+    } catch (err) {
+      if (signal?.aborted) throw err
+    }
+  }
   const { base64 } = await readFileAsBase64(sourcePath)
   const bytes = decodeBase64ToBytes(base64)
+  if (useV1) {
+    return parseWithLocalMineruV1(config, fileName, bytes, onProgress, signal, assetOptions)
+  }
+  const localBackend = localMineruBackendForVersion(configuredBackend, serverVersion)
   const fileBuffer = bytes.buffer.slice(
     bytes.byteOffset,
     bytes.byteOffset + bytes.byteLength,
@@ -684,7 +915,7 @@ async function parseWithLocalMineru(
   const form = new FormData()
   form.append("files", new Blob([fileBuffer], { type: "application/pdf" }), fileName)
   form.append("lang_list", config.localLanguage || "ch")
-  form.append("backend", config.localBackend || "hybrid-engine")
+  form.append("backend", localBackend)
   form.append("effort", config.localEffort || "medium")
   form.append("parse_method", config.localParseMethod || "auto")
   form.append("formula_enable", String(config.localFormulaEnabled !== false))
@@ -696,11 +927,11 @@ async function parseWithLocalMineru(
   if (config.localServerUrl?.trim()) form.append("server_url", config.localServerUrl.trim())
 
   onProgress?.("Uploading to local MinerU...")
-  const submitRes = await httpFetch(`${apiBase}/tasks`, {
+  const submitRes = await httpFetch(`${apiBase}/tasks`, localMineruRequestInit(config.localToken, {
     method: "POST",
     signal,
     body: form,
-  })
+  }))
   if (!submitRes.ok) {
     const text = await submitRes.text().catch(() => "")
     throw new Error(`Local MinerU submit failed: HTTP ${submitRes.status}: ${text}`)
@@ -721,7 +952,9 @@ async function parseWithLocalMineru(
   while (Date.now() - start < LOCAL_POLL_TIMEOUT_MS) {
     throwIfAborted(signal)
 
-    const statusRes = await httpFetch(statusUrl, { signal })
+    const statusRes = await httpFetch(statusUrl, localMineruRequestInit(config.localToken, {
+      signal,
+    }))
     if (!statusRes.ok) {
       throw new Error(`Local MinerU status check failed: HTTP ${statusRes.status}`)
     }
@@ -729,7 +962,9 @@ async function parseWithLocalMineru(
 
     if (status.status === "completed") {
       onProgress?.("Downloading parsed result...")
-      const resultRes = await httpFetch(resultUrl, { signal })
+      const resultRes = await httpFetch(resultUrl, localMineruRequestInit(config.localToken, {
+        signal,
+      }))
       if (!resultRes.ok) {
         throw new Error(`Local MinerU download failed: HTTP ${resultRes.status}`)
       }
@@ -886,24 +1121,40 @@ export async function parseWithMineruResult(
  * Test MinerU connectivity.
  *
  * Cloud backend: submits a minimal task to validate the token.
- * Local backend: checks the local service health endpoint (no token needed).
+ * Local backend: checks the local service health endpoint with its optional token.
  */
 export async function testMineruConnection(
   token: string,
-  config?: Pick<MineruConfig, "backend" | "localEndpoint">,
+  config?: Pick<MineruConfig, "backend" | "localEndpoint" | "localToken">,
 ): Promise<void> {
   const httpFetch = await getHttpFetch()
 
   if (config?.backend === "local") {
-    const res = await httpFetch(`${localMineruApiBase(config.localEndpoint)}/health`)
-    if (!res.ok) {
+    const base = localMineruApiBase(config.localEndpoint)
+    const res = await httpFetch(
+      `${base}/health`,
+      localMineruRequestInit(config.localToken),
+    )
+    if (res.ok) {
+      const health = await res.json().catch(() => null) as { status?: unknown } | null
+      if (health?.status === "healthy") return
+      if (health?.status === "ok" && /\/v1$/i.test(base)) return
+      throw new Error("Local MinerU service returned an invalid or unhealthy status")
+    }
+    if (res.status !== 404) {
       const text = await res.text().catch(() => "")
       throw new Error(`Local MinerU service unavailable: HTTP ${res.status}: ${text}`)
     }
-    const health = await res.json().catch(() => null) as { status?: unknown } | null
-    if (health?.status !== "healthy") {
-      throw new Error("Local MinerU service returned an invalid or unhealthy status")
+    const v1 = await httpFetch(
+      `${localMineruV1Base(config.localEndpoint)}/health`,
+      localMineruRequestInit(config.localToken),
+    )
+    if (!v1.ok) {
+      const text = await v1.text().catch(() => "")
+      throw new Error(`Local MinerU V1 service unavailable: HTTP ${v1.status}: ${text}`)
     }
+    const health = await v1.json().catch(() => null) as { status?: unknown } | null
+    if (health?.status !== "ok") throw new Error("Local MinerU V1 service returned an invalid status")
     return
   }
 

@@ -5,6 +5,7 @@ const mocks = vi.hoisted(() => ({
   copyFile: vi.fn(),
   fileExists: vi.fn(),
   getFileMd5: vi.fn(),
+  getFileModifiedTime: vi.fn(),
   getFileSize: vi.fn(),
   listDirectory: vi.fn(),
   preprocessFile: vi.fn(),
@@ -16,12 +17,17 @@ const mocks = vi.hoisted(() => ({
   isIngestableSourcePath: vi.fn(),
   loadScheduledImportConfig: vi.fn(),
   saveScheduledImportConfig: vi.fn(),
+  getRecentProjects: vi.fn(),
+  loadSourceWatchConfig: vi.fn(),
+  enqueueInactiveProjectBatch: vi.fn(),
+  folderContextForSourcePath: vi.fn(),
 }))
 
 vi.mock("@/commands/fs", () => ({
   copyFile: mocks.copyFile,
   fileExists: mocks.fileExists,
   getFileMd5: mocks.getFileMd5,
+  getFileModifiedTime: mocks.getFileModifiedTime,
   getFileSize: mocks.getFileSize,
   listDirectory: mocks.listDirectory,
   preprocessFile: mocks.preprocessFile,
@@ -32,16 +38,20 @@ vi.mock("@/commands/fs", () => ({
 vi.mock("@/lib/source-lifecycle", () => ({
   deleteSourceFile: mocks.deleteSourceFile,
   enqueueSourceIngest: mocks.enqueueSourceIngest,
+  folderContextForSourcePath: mocks.folderContextForSourcePath,
   isIngestableSourcePath: mocks.isIngestableSourcePath,
 }))
 
 vi.mock("@/lib/ingest-queue", () => ({
   discardTasksForSources: mocks.discardTasksForSources,
+  enqueueInactiveProjectBatch: mocks.enqueueInactiveProjectBatch,
 }))
 
 vi.mock("@/lib/project-store", () => ({
   loadScheduledImportConfig: mocks.loadScheduledImportConfig,
   saveScheduledImportConfig: mocks.saveScheduledImportConfig,
+  getRecentProjects: mocks.getRecentProjects,
+  loadSourceWatchConfig: mocks.loadSourceWatchConfig,
 }))
 
 import {
@@ -49,6 +59,7 @@ import {
   resolveImportPath,
   scheduledImportDestinationForFile,
   scanAndImport,
+  isScheduledImportDue,
   shouldSkipScheduledImportConfigFile,
   shouldSkipScheduledImportFile,
 } from "./scheduled-import"
@@ -59,6 +70,19 @@ describe("scheduled import path handling", () => {
 
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.getRecentProjects.mockResolvedValue([])
+  })
+
+  it("runs scheduled imports only after their configured interval", () => {
+    const config = {
+      enabled: true,
+      path: "/Users/me/inbox",
+      interval: 30,
+      lastScan: 1_000,
+    }
+    expect(isScheduledImportDue(config, 1_000 + 29 * 60_000)).toBe(false)
+    expect(isScheduledImportDue(config, 1_000 + 30 * 60_000)).toBe(true)
+    expect(isScheduledImportDue({ ...config, enabled: false }, Number.MAX_SAFE_INTEGER)).toBe(false)
   })
 
   it("resolves relative paths from the project root", () => {
@@ -209,6 +233,18 @@ describe("scanAndImport failure handling", () => {
     vi.clearAllMocks()
     useWikiStore.setState({
       project,
+      sourceWatchConfig: {
+        enabled: true,
+        autoIngest: true,
+        persistExtractedMarkdown: true,
+        parsingConcurrency: 2,
+        ingestConcurrency: 2,
+        includeExtensions: [],
+        excludeExtensions: [],
+        excludeDirs: [],
+        excludeGlobs: [],
+        maxFileSizeMb: 100,
+      },
       llmConfig: {
         provider: "openai",
         apiKey: "test-key",
@@ -221,6 +257,7 @@ describe("scanAndImport failure handling", () => {
     mocks.fileExists.mockResolvedValue(false)
     mocks.readFile.mockResolvedValue("")
     mocks.getFileSize.mockResolvedValue(1024)
+    mocks.getFileModifiedTime.mockResolvedValue(1111)
     mocks.getFileMd5.mockResolvedValue("md5-new")
     mocks.copyFile.mockResolvedValue(undefined)
     mocks.deleteSourceFile.mockResolvedValue({
@@ -236,7 +273,12 @@ describe("scanAndImport failure handling", () => {
       interval: 60,
       lastScan: null,
     })
+    mocks.loadSourceWatchConfig.mockResolvedValue(
+      useWikiStore.getState().sourceWatchConfig,
+    )
     mocks.saveScheduledImportConfig.mockResolvedValue(undefined)
+    mocks.enqueueInactiveProjectBatch.mockResolvedValue(["background-task-1"])
+    mocks.folderContextForSourcePath.mockReturnValue("scheduled-import")
     mocks.writeFileAtomic.mockResolvedValue(undefined)
     mocks.listDirectory.mockImplementation(async (path: string) => {
       if (path === "/Users/me/inbox") {
@@ -325,6 +367,31 @@ describe("scanAndImport failure handling", () => {
       expect.any(Object),
     )
     expect(mocks.writeFileAtomic).toHaveBeenCalled()
+  })
+
+  it("copies and durably queues changed files for an inactive project", async () => {
+    useWikiStore.setState({
+      project: {
+        id: "active-project",
+        name: "Active",
+        path: "/Users/me/active-project",
+      },
+    })
+
+    await scanAndImport(project, "/Users/me/inbox", { allowInactive: true })
+
+    const destination = "/Users/me/wiki-project/raw/sources/scheduled-import/paper.pdf"
+    expect(mocks.copyFile).toHaveBeenCalledWith("/Users/me/inbox/paper.pdf", destination)
+    expect(mocks.enqueueSourceIngest).not.toHaveBeenCalled()
+    expect(mocks.enqueueInactiveProjectBatch).toHaveBeenCalledWith(
+      project.id,
+      project.path,
+      [{ sourcePath: destination, folderContext: "scheduled-import" }],
+    )
+    expect(mocks.writeFileAtomic).toHaveBeenCalledWith(
+      "/Users/me/wiki-project/.llm-wiki/scheduled-import-db.json",
+      expect.stringContaining('"/Users/me/inbox/paper.pdf": "md5-new"'),
+    )
   })
 
   it("skips large files before hashing or copying", async () => {
@@ -432,5 +499,232 @@ describe("scanAndImport failure handling", () => {
       "/Users/me/wiki-project/raw/sources/scheduled-import/settings.json",
       expect.any(Object),
     )
+  })
+
+  it("cleans an imported source after a source-watch directory exclusion is added", async () => {
+    useWikiStore.setState({
+      sourceWatchConfig: {
+        ...useWikiStore.getState().sourceWatchConfig,
+        excludeDirs: ["archive"],
+      },
+    })
+    mocks.fileExists.mockResolvedValue(true)
+    mocks.readFile.mockResolvedValue(JSON.stringify({
+      version: 1,
+      directories: {
+        "/Users/me/inbox": {
+          files: { "/Users/me/inbox/archive/old.pdf": "old-md5" },
+          lastScan: 123,
+        },
+      },
+    }))
+    mocks.listDirectory.mockResolvedValue([
+      {
+        name: "archive",
+        path: "/Users/me/inbox/archive",
+        is_dir: true,
+        children: [
+          {
+            name: "old.pdf",
+            path: "/Users/me/inbox/archive/old.pdf",
+            is_dir: false,
+          },
+        ],
+      },
+    ])
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    const mirror = "/Users/me/wiki-project/raw/sources/scheduled-import/archive/old.pdf"
+    expect(mocks.discardTasksForSources).toHaveBeenCalledWith([mirror])
+    expect(mocks.deleteSourceFile).toHaveBeenCalledWith(
+      project.path,
+      mirror,
+      expect.objectContaining({
+        logReason: "scheduled import source removed or excluded",
+      }),
+    )
+  })
+
+  it("applies an inactive project's persisted source-watch exclusions", async () => {
+    useWikiStore.setState({
+      project: {
+        id: "active-project",
+        name: "Active",
+        path: "/Users/me/active-project",
+      },
+    })
+    mocks.loadSourceWatchConfig.mockResolvedValue({
+      ...useWikiStore.getState().sourceWatchConfig,
+      excludeGlobs: ["*.draft.pdf"],
+    })
+    mocks.listDirectory.mockResolvedValue([
+      {
+        name: "paper.draft.pdf",
+        path: "/Users/me/inbox/paper.draft.pdf",
+        is_dir: false,
+      },
+    ])
+
+    await scanAndImport(project, "/Users/me/inbox", { allowInactive: true })
+
+    expect(mocks.loadSourceWatchConfig).toHaveBeenCalledWith(project.id)
+    expect(mocks.getFileSize).not.toHaveBeenCalled()
+    expect(mocks.copyFile).not.toHaveBeenCalled()
+    expect(mocks.enqueueInactiveProjectBatch).not.toHaveBeenCalled()
+  })
+
+  it("uses the lower scheduled-import and source-watch file size limit", async () => {
+    useWikiStore.setState({
+      sourceWatchConfig: {
+        ...useWikiStore.getState().sourceWatchConfig,
+        maxFileSizeMb: 5,
+      },
+    })
+    mocks.getFileSize.mockResolvedValue(6 * 1024 * 1024)
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    expect(mocks.getFileMd5).not.toHaveBeenCalled()
+    expect(mocks.copyFile).not.toHaveBeenCalled()
+  })
+})
+
+describe("scanAndImport stat-cache fast path", () => {
+  const project: WikiProject = {
+    id: "project-1",
+    name: "Project",
+    path: "/Users/me/wiki-project",
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    useWikiStore.setState({
+      project,
+      sourceWatchConfig: {
+        enabled: true,
+        autoIngest: true,
+        persistExtractedMarkdown: true,
+        parsingConcurrency: 2,
+        ingestConcurrency: 2,
+        includeExtensions: [],
+        excludeExtensions: [],
+        excludeDirs: [],
+        excludeGlobs: [],
+        maxFileSizeMb: 100,
+      },
+      llmConfig: {
+        provider: "openai",
+        apiKey: "test-key",
+        model: "gpt-test",
+        ollamaUrl: "",
+        customEndpoint: "",
+        maxContextSize: 1000,
+      },
+    })
+    mocks.fileExists.mockResolvedValue(true)
+    mocks.readFile.mockResolvedValue("")
+    mocks.getFileSize.mockResolvedValue(1024)
+    mocks.getFileModifiedTime.mockResolvedValue(1111)
+    mocks.getFileMd5.mockResolvedValue("md5-new")
+    mocks.copyFile.mockResolvedValue(undefined)
+    mocks.deleteSourceFile.mockResolvedValue({
+      deletedWikiPaths: [],
+      rewrittenSourcePages: 0,
+    })
+    mocks.discardTasksForSources.mockResolvedValue(0)
+    mocks.preprocessFile.mockResolvedValue("")
+    mocks.isIngestableSourcePath.mockReturnValue(true)
+    mocks.loadScheduledImportConfig.mockResolvedValue({
+      enabled: true,
+      path: "/Users/me/inbox",
+      interval: 60,
+      lastScan: null,
+    })
+    mocks.loadSourceWatchConfig.mockResolvedValue(
+      useWikiStore.getState().sourceWatchConfig,
+    )
+    mocks.saveScheduledImportConfig.mockResolvedValue(undefined)
+    mocks.enqueueSourceIngest.mockResolvedValue(["task-1"])
+    mocks.enqueueInactiveProjectBatch.mockResolvedValue(["background-task-1"])
+    mocks.folderContextForSourcePath.mockReturnValue("scheduled-import")
+    mocks.writeFileAtomic.mockResolvedValue(undefined)
+    mocks.listDirectory.mockImplementation(async (path: string) => {
+      if (path === "/Users/me/inbox") {
+        return [
+          { name: "paper.pdf", path: "/Users/me/inbox/paper.pdf", is_dir: false },
+        ]
+      }
+      return []
+    })
+  })
+
+  function dbWithStatCache(md5: string, stat: { size: number; mtime: number }) {
+    return JSON.stringify({
+      version: 1,
+      directories: {
+        "/Users/me/inbox": {
+          files: { "/Users/me/inbox/paper.pdf": md5 },
+          statCache: { "/Users/me/inbox/paper.pdf": stat },
+          lastScan: 123,
+        },
+      },
+    })
+  }
+
+  it("reuses the recorded hash when size and mtime are unchanged", async () => {
+    mocks.readFile.mockResolvedValue(dbWithStatCache("stable-md5", { size: 1024, mtime: 1111 }))
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    expect(mocks.getFileMd5).not.toHaveBeenCalled()
+    expect(mocks.copyFile).not.toHaveBeenCalled()
+    expect(mocks.enqueueSourceIngest).not.toHaveBeenCalled()
+    expect(mocks.writeFileAtomic).toHaveBeenCalledWith(
+      "/Users/me/wiki-project/.llm-wiki/scheduled-import-db.json",
+      expect.stringContaining('"stable-md5"'),
+    )
+  })
+
+  it("re-hashes when the stat changed but keeps the record when content is identical", async () => {
+    mocks.readFile.mockResolvedValue(dbWithStatCache("stable-md5", { size: 1024, mtime: 1111 }))
+    mocks.getFileModifiedTime.mockResolvedValue(2222)
+    mocks.getFileMd5.mockResolvedValue("stable-md5")
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    expect(mocks.getFileMd5).toHaveBeenCalledTimes(1)
+    expect(mocks.copyFile).not.toHaveBeenCalled()
+    expect(mocks.enqueueSourceIngest).not.toHaveBeenCalled()
+    const calls = mocks.writeFileAtomic.mock.calls
+    const written = String(calls[calls.length - 1]?.[1] ?? "")
+    expect(written).toContain('"stable-md5"')
+    expect(written).toContain('"mtime": 2222')
+  })
+
+  it("hashes and imports files that have no stat cache yet", async () => {
+    mocks.readFile.mockResolvedValue(JSON.stringify({
+      version: 1,
+      directories: {
+        "/Users/me/inbox": {
+          files: { "/Users/me/inbox/paper.pdf": "old-md5" },
+          lastScan: 123,
+        },
+      },
+    }))
+    mocks.getFileMd5.mockResolvedValue("fresh-md5")
+
+    await scanAndImport(project, "/Users/me/inbox")
+
+    expect(mocks.getFileMd5).toHaveBeenCalledTimes(1)
+    expect(mocks.copyFile).toHaveBeenCalledWith(
+      "/Users/me/inbox/paper.pdf",
+      "/Users/me/wiki-project/raw/sources/scheduled-import/paper.pdf",
+    )
+    expect(mocks.enqueueSourceIngest).toHaveBeenCalled()
+    const calls = mocks.writeFileAtomic.mock.calls
+    const written = String(calls[calls.length - 1]?.[1] ?? "")
+    expect(written).toContain('"fresh-md5"')
+    expect(written).toContain('"mtime": 1111')
   })
 })

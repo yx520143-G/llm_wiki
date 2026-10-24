@@ -8,6 +8,7 @@ import {
 import {
   isAdaptiveAnthropicModel,
   isGeminiThinkingLevelModel,
+  isOpenRouterEndpoint,
   normalizeReasoningForProvider,
 } from "@/lib/reasoning-capabilities"
 
@@ -352,7 +353,18 @@ function isDeepSeekEndpoint(config: LlmConfig): boolean {
 }
 
 function supportsDeepSeekThinkingParam(config: LlmConfig): boolean {
-  return /deepseek[-_]?v4/i.test(config.model)
+  return /deepseek[-_]?(?:v4|flash)(?:[-_.]|$)/i.test(config.model)
+}
+
+const PROTECTED_EXTRA_BODY_FIELDS = new Set([
+  "messages", "model", "stream", "stream_options", "__proto__", "constructor", "prototype",
+])
+
+function mergeExtraRequestBody(config: LlmConfig, body: Record<string, unknown>): void {
+  if (config.provider !== "custom" || config.apiMode === "anthropic_messages") return
+  for (const [key, value] of Object.entries(config.extraRequestBody ?? {})) {
+    if (!PROTECTED_EXTRA_BODY_FIELDS.has(key)) body[key] = value
+  }
 }
 
 function isKimiEndpoint(config: LlmConfig): boolean {
@@ -384,7 +396,7 @@ function isOpenAiStrictCompletionModel(config: LlmConfig): boolean {
 
   const model = config.model.trim().toLowerCase()
   const strictModel =
-    /^gpt-5(?:[.\-_]|$)/.test(model) || /^o\d+(?:[.\-_]|$)/.test(model)
+    /^gpt-(?:[5-9]|\d{2,})(?:[.\-_]|$)/.test(model) || /^o\d+(?:[.\-_]|$)/.test(model)
   if (!strictModel) return false
   if (config.provider === "openai" || config.provider === "azure") return true
   return config.provider === "custom" && isAzureOpenAiEndpoint(config.customEndpoint)
@@ -459,9 +471,19 @@ function buildOpenAiCompatibleBody(
     stripWireAgnosticOverrides(overrides),
     streaming,
   )
+  mergeExtraRequestBody(config, body)
   adaptOpenAiStrictCompletionBody(config, body)
   adaptKimiBody(config, body)
   adaptXiaomiMimoBody(config, body, reasoning)
+
+  if (config.provider === "custom" && isOpenRouterEndpoint(config.customEndpoint)) {
+    if (reasoning.mode === "custom" && reasoning.budgetTokens !== undefined) {
+      body.reasoning = { max_tokens: reasoning.budgetTokens }
+    } else if (reasoning.mode !== "auto") {
+      body.reasoning = { effort: reasoning.mode === "off" ? "none" : reasoning.mode }
+    }
+    return body
+  }
 
   if (isDeepSeekEndpoint(config)) {
     // DeepSeek V4 thinking mode. `thinking.type=disabled` is the most
@@ -509,9 +531,14 @@ function buildOpenAiCompatibleBody(
     return body
   }
 
-  if (config.provider === "openai" && reasoning.mode !== "auto" && reasoning.mode !== "off") {
+  if (config.provider === "openai" && reasoning.mode === "off"
+    && /^gpt-(?:[6-9]|\d{2,})(?:[.\-_]|$)/i.test(config.model.trim())) {
+    body.reasoning_effort = "none"
+  } else if (config.provider === "openai" && reasoning.mode !== "auto" && reasoning.mode !== "off") {
     if (reasoning.mode === "low" || reasoning.mode === "medium" || reasoning.mode === "high") {
       body.reasoning_effort = reasoning.mode
+    } else if (reasoning.mode === "max") {
+      body.reasoning_effort = "xhigh"
     }
   }
 

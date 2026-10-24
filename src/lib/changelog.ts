@@ -21,10 +21,164 @@ export interface ChangelogEntry {
   highlights: {
     en: string[]
     zh: string[]
+    it?: string[]
+    ru?: string[]
   }
 }
 
 export const CHANGELOG: ChangelogEntry[] = [
+  {
+    version: "0.6.13",
+    date: "2026-10-21",
+    highlights: {
+      en: [
+        "Added MinerU 4 V1 API support while preserving compatibility with legacy MinerU deployments.",
+        "Added back and forward navigation to file previews and improved path-style Wiki link navigation across platforms.",
+        "Added removal of stopped Ingest tasks and improved background scanning and queue performance.",
+        "Expanded custom OpenAI-compatible provider request options and adapted model parameters to provider capabilities.",
+        "Improved Wiki overview and review lifecycle management, including cleanup and bulk operations.",
+        "Improved large-document Ingest reliability and fixed long filenames, source summaries, and CLI timeout diagnostics.",
+      ],
+      zh: [
+        "新增 MinerU 4 V1 API 支持，同时兼容旧版 MinerU 部署。",
+        "文件预览新增前进与后退导航，并完善跨平台路径式 Wiki 链接跳转。",
+        "支持移除已停止的 Ingest 任务，并优化后台扫描与队列性能。",
+        "扩展自定义 OpenAI 兼容 Provider 的请求选项，并根据模型能力适配参数。",
+        "完善 Wiki 概览与 Review 生命周期管理，包括清理和批量操作。",
+        "提升大型文档 Ingest 可靠性，并修复长文件名、来源摘要和 CLI 超时诊断问题。",
+      ],
+      it: [
+        "Aggiunto il supporto per l'API MinerU 4 V1, mantenendo la compatibilità con le installazioni MinerU precedenti.",
+        "Aggiunta la navigazione avanti e indietro nelle anteprime dei file e migliorati i collegamenti Wiki basati su percorsi multipiattaforma.",
+        "Aggiunta la rimozione delle attività Ingest arrestate e ottimizzate scansione in background e prestazioni della coda.",
+        "Ampliate le opzioni di richiesta dei provider personalizzati compatibili con OpenAI e adattati i parametri alle capacità dei modelli.",
+        "Migliorata la gestione del ciclo di vita di panoramiche Wiki e Review, incluse pulizia e operazioni in blocco.",
+        "Migliorata l'affidabilita di Ingest per documenti di grandi dimensioni e corretti nomi file lunghi, riepiloghi delle fonti e diagnostica dei timeout CLI.",
+      ],
+      ru: [
+        "Добавлена поддержка MinerU 4 V1 API с сохранением совместимости с прежними версиями MinerU.",
+        "В предпросмотр файлов добавлена навигация назад и вперёд, а переходы по Wiki-ссылкам с путями улучшены для разных платформ.",
+        "Добавлено удаление остановленных задач Ingest, оптимизированы фоновое сканирование и работа очереди.",
+        "Расширены параметры запросов для пользовательских OpenAI-совместимых провайдеров и адаптация параметров к возможностям моделей.",
+        "Улучшено управление жизненным циклом обзоров Wiki и Review, включая очистку и пакетные операции.",
+        "Повышена надёжность Ingest больших документов и исправлены длинные имена файлов, сводки источников и диагностика тайм-аутов CLI.",
+      ],
+    },
+  },
+  {
+    version: "0.6.12",
+    date: "2026-09-27",
+    highlights: {
+      en: [
+        "Added background source monitoring across recent projects and raised configurable document processing and Ingest concurrency limits to 64.",
+        "Added verified MCP wiki-page writes and standalone PNG, JPG, and JPEG image ingestion with multimodal captions.",
+        "Made Ingest resumable after interrupted generation, added schema-based page routing, and strengthened truncation and queue recovery.",
+        "Improved Deep Research with project-grounded queries, source relevance filtering, and better entity-page selection.",
+        "Improved large knowledge-graph loading, analysis, link resolution, and API performance.",
+        "Fixed duplicate vector identities, malformed generated wikilinks, page-merge scaffolding, and image paths containing spaces.",
+        "Improved Anthropic-compatible provider authentication and Claude CLI diagnostics, OAuth errors, and timeout handling.",
+        "Improved spreadsheet dates, dark-theme controls, macOS release checks, and general stability and compatibility.",
+      ],
+      zh: [
+        "新增最近项目的后台资料监控，并将可配置的文档处理和 Ingest 并发上限提升至 64。",
+        "新增经过校验的 MCP Wiki 页面写入，以及 PNG、JPG、JPEG 图片资料摄取与多模态描述。",
+        "Ingest 支持生成中断恢复和基于 Schema 的页面路由，并强化截断检测与队列恢复。",
+        "深度研究新增项目语境查询、来源相关性过滤，并改进实体页面筛选。",
+        "优化大型知识图谱的加载、分析、链接解析和 API 性能。",
+        "修复向量 ID 冲突、生成式 Wiki 链接异常、页面合并模板残留及含空格的图片路径。",
+        "完善 Anthropic 兼容 Provider 鉴权，以及 Claude CLI 诊断、OAuth 错误和超时处理。",
+        "改进电子表格日期、深色主题控件、macOS 发布检查及整体稳定性与兼容性。",
+      ],
+      it: [
+        "Aggiunto il monitoraggio in background delle fonti nei progetti recenti e aumentato a 64 il limite configurabile di elaborazione documenti e Ingest.",
+        "Aggiunte la scrittura verificata delle pagine Wiki tramite MCP e l'acquisizione di immagini PNG, JPG e JPEG con descrizioni multimodali.",
+        "Ingest ora riprende dopo un'interruzione, instrada le pagine in base allo Schema e gestisce meglio troncamenti e ripristino della coda.",
+        "Migliorata la Ricerca approfondita con query basate sul contesto del progetto, filtro di pertinenza delle fonti e selezione più accurata delle entità.",
+        "Ottimizzate prestazioni, analisi, risoluzione dei collegamenti e API dei grafi della conoscenza di grandi dimensioni.",
+        "Corretti conflitti degli ID vettoriali, wikilink generati non validi, residui dei template di unione e percorsi immagine con spazi.",
+        "Migliorati l'autenticazione dei provider compatibili con Anthropic e i messaggi diagnostici, OAuth e timeout di Claude CLI.",
+        "Migliorate date dei fogli di calcolo, controlli del tema scuro, verifiche delle release macOS, stabilità e compatibilità generali.",
+      ],
+      ru: [
+        "Добавлен фоновый мониторинг источников во всех недавних проектах, а настраиваемый предел параллельной обработки документов и Ingest увеличен до 64.",
+        "Добавлены проверенная запись Wiki-страниц через MCP и импорт изображений PNG, JPG и JPEG с мультимодальными описаниями.",
+        "Ingest теперь возобновляется после прерывания генерации, маршрутизирует страницы по Schema и надёжнее обрабатывает усечение и восстановление очереди.",
+        "Улучшено глубокое исследование: запросы учитывают контекст проекта, источники фильтруются по релевантности, а страницы сущностей создаются точнее.",
+        "Оптимизированы загрузка, анализ, разрешение ссылок и API больших графов знаний.",
+        "Исправлены конфликты векторных ID, некорректные сгенерированные Wiki-ссылки, остатки шаблонов слияния и пути к изображениям с пробелами.",
+        "Улучшены аутентификация Anthropic-совместимых провайдеров, диагностика Claude CLI, обработка OAuth-ошибок и тайм-аутов.",
+        "Улучшены даты в таблицах, элементы тёмной темы, проверки релизов macOS, общая стабильность и совместимость.",
+      ],
+    },
+  },
+  {
+    version: "0.6.11",
+    date: "2026-08-25",
+    highlights: {
+      en: [
+        "Added configurable reasoning effort for Ingest tasks across supported models and providers.",
+        "Fixed Claude Code CLI provider tests by preserving local isolation settings and passing MCP configuration arguments correctly.",
+        "Made raw source file lists use consistent natural numeric ordering across the app.",
+        "Prevented stale raw source entries from appearing when switching projects.",
+        "Expanded source-build documentation and improved related tests, stability, and compatibility.",
+      ],
+      zh: [
+        "新增可配置的 Ingest 推理强度，并完善不同模型与 Provider 的适配。",
+        "修复 Claude Code CLI Provider 测试，保留本地隔离设置并正确传递 MCP 配置参数。",
+        "原始资料列表统一使用自然数字排序。",
+        "修复切换项目时可能短暂显示旧项目原始资料的问题。",
+        "补充源码构建文档，并完善相关测试、稳定性与兼容性。",
+      ],
+    },
+  },
+  {
+    version: "0.6.10",
+    date: "2026-08-21",
+    highlights: {
+      en: [
+        "Added source-based knowledge filtering.",
+        "Added batch Deep Research for review items and support for rerunning completed or failed research tasks.",
+        "Added support for MinerU 3.0-3.2 backend names and made image captions follow the configured output language.",
+        "Added detailed reporting for files skipped during source import.",
+        "Improved large duplicate scans and fixed Deep Research concurrency, file naming, vector indexing, and wikilink consistency.",
+        "Improved Agent model routing and provider compatibility, and fixed language detection, retry behavior, and Windows CRLF data integrity issues.",
+      ],
+      zh: [
+        "新增按原始资料来源筛选知识内容。",
+        "Review 支持批量执行深度研究，并可重新运行已完成或失败的研究任务。",
+        "支持 MinerU 3.0-3.2 后端名称，图片描述会遵循配置的输出语言。",
+        "文件导入新增跳过文件及具体原因的详细报告。",
+        "优化大规模重复文件扫描，并修复深度研究并发、文件命名、向量索引和 Wiki 链接一致性问题。",
+        "完善 Agent 模型路由与 Provider 兼容性，并修复语言误判、重试行为和 Windows CRLF 数据完整性问题。",
+      ],
+    },
+  },
+  {
+    version: "0.6.9",
+    date: "2026-08-14",
+    highlights: {
+      en: [
+        "Added a single-page Wiki vector indexing API and MCP tool with safe incremental updates.",
+        "Added an answer context details panel for inspecting context size, categorized references, and knowledge-graph evidence.",
+        "Added streaming Chat API responses and concurrent Ingest processing for faster external integrations and bulk imports.",
+        "Made file history opt-in and configurable, with bounded version retention.",
+        "Expanded scheduled imports with cross-project monitoring and source name or path filtering.",
+        "Added external source-file opening, a global Settings shortcut, and Russian and Italian interface translations.",
+        "Added support for authenticated local MinerU and improved trusted proxy TLS options, CJK filenames, and structured data preservation during Ingest.",
+        "Improved existing features and fixed stability, compatibility, indexing, and data-integrity issues.",
+      ],
+      zh: [
+        "新增单个 Wiki 页面向量索引 API 和 MCP 工具，并支持安全的增量更新。",
+        "新增回答上下文详情面板，可查看上下文长度、分类引用和知识图谱证据。",
+        "Chat API 新增流式输出，并支持并发 Ingest，提升外部集成和批量导入效率。",
+        "文件历史改为可选功能，并支持配置有限的版本保留数量。",
+        "扩展定时导入，支持跨项目监控以及按来源名称或路径过滤。",
+        "支持使用系统默认程序打开原始资料，新增全局设置快捷键，并加入俄语和意大利语界面。",
+        "完善本地 MinerU 鉴权、受信任代理 TLS 选项、CJK 文件名和 Ingest 结构化数据保留。",
+        "优化现有功能，并修复稳定性、兼容性、索引和数据完整性问题。",
+      ],
+    },
+  },
   {
     version: "0.6.8",
     date: "2026-08-07",

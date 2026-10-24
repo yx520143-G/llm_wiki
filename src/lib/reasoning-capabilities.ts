@@ -10,6 +10,7 @@ export interface ReasoningCapabilities {
 
 const AUTO_ONLY = ["auto"] as const
 const OPENAI_LEVELS = ["auto", "low", "medium", "high"] as const
+const OPENAI_FUTURE_LEVELS = ["auto", "off", "low", "medium", "high", "max"] as const
 const BUDGET_LEVELS = ["auto", "off", "low", "medium", "high", "max", "custom"] as const
 const THINKING_REQUIRED_BUDGETS = ["auto", "low", "medium", "high", "max", "custom"] as const
 const THINKING_REQUIRED_LEVELS = ["auto", "low", "medium", "high", "max"] as const
@@ -51,7 +52,20 @@ function isGemini3(model: string): boolean {
 function isOpenAiReasoningModel(config: LlmConfig): boolean {
   if (config.provider === "azure" && config.azureModelFamily === "gpt5") return true
   const model = config.model.trim().toLowerCase()
-  return /^(?:gpt-5|o\d+)(?:[.\-_]|$)/.test(model)
+  return /^(?:gpt-(?:[5-9]|\d{2,})|o\d+)(?:[.\-_]|$)/.test(model)
+}
+
+function isOpenAiFutureReasoningModel(config: LlmConfig): boolean {
+  return /^gpt-(?:[6-9]|\d{2,})(?:[.\-_]|$)/.test(config.model.trim().toLowerCase())
+}
+
+export function isOpenRouterEndpoint(endpoint: string): boolean {
+  try {
+    const hostname = new URL(endpoint).hostname.toLowerCase()
+    return hostname === "openrouter.ai" || hostname.endsWith(".openrouter.ai")
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -80,10 +94,12 @@ export function resolveReasoningCapabilities(config: LlmConfig): ReasoningCapabi
   }
   if (config.provider === "minimax") return capabilities(AUTO_ONLY)
   if (config.provider === "openai" || config.provider === "azure") {
+    if (isOpenAiFutureReasoningModel(config)) return capabilities(OPENAI_FUTURE_LEVELS)
     return capabilities(isOpenAiReasoningModel(config) ? OPENAI_LEVELS : AUTO_ONLY)
   }
   if (config.provider === "custom") {
     const endpoint = config.customEndpoint.toLowerCase()
+    if (isOpenRouterEndpoint(endpoint)) return capabilities(BUDGET_LEVELS)
     if (/api\.deepseek\.(?:com|cn)(?:[:/]|$)/.test(endpoint)) {
       return capabilities(DEEPSEEK_LEVELS)
     }
@@ -104,6 +120,24 @@ export function normalizeReasoningForProvider(
   requested: ReasoningConfig,
 ): ReasoningConfig {
   return resolveReasoningCapabilities(config).normalize(requested)
+}
+
+/**
+ * Reasoning for ingest's structured calls. Ingest hardcodes `{ mode: "off" }`
+ * at every call site, which is the right default — thinking buys little on
+ * structured extraction and a model that spends its budget on chain-of-thought
+ * can return empty `content`, losing the page — but it is wrong as a *rule*:
+ * some models reject disabling reasoning outright and answer 400, so every
+ * ingest call fails with no way to fix it from the UI. Making it settable is
+ * what lets those providers be used; "off" stays the default so existing
+ * setups behave exactly as before.
+ *
+ * Keep this helper provider-agnostic. The provider layer normalizes the saved
+ * value once when it builds the wire payload, including stale settings left by
+ * a provider or model change.
+ */
+export function resolveIngestReasoning(config: LlmConfig): ReasoningConfig {
+  return config.ingestReasoning ?? { mode: "off" }
 }
 
 export function isAdaptiveAnthropicModel(config: LlmConfig): boolean {

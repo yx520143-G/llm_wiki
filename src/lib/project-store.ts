@@ -209,6 +209,7 @@ function normalizeMineruConfig(config: MineruConfig): MineruConfig {
       typeof config.localEndpoint === "string" && config.localEndpoint.trim()
         ? config.localEndpoint.trim()
         : DEFAULT_LOCAL_MINERU_ENDPOINT,
+    localToken: typeof config.localToken === "string" ? config.localToken.trim() : "",
     localBackend: LOCAL_MINERU_BACKENDS.has(config.localBackend ?? "")
       ? config.localBackend
       : "hybrid-engine",
@@ -407,6 +408,7 @@ const OUTPUT_LANGUAGE_KEY = "outputLanguage"
 const PROJECT_OUTPUT_LANGUAGE_KEY = "projectOutputLanguages"
 const PROJECT_FILE_SYNC_KEY = "projectFileSyncEnabled"
 const SOURCE_WATCH_CONFIG_KEY = "sourceWatchConfig"
+const SOURCE_WATCH_ALL_PROJECTS_KEY = "sourceWatchAllProjects"
 
 export async function saveOutputLanguage(lang: OutputLanguage, projectId?: string): Promise<void> {
   const store = await getStore()
@@ -469,6 +471,17 @@ export async function loadSourceWatchConfig(projectId?: string): Promise<SourceW
 
   const legacyEnabled = await loadProjectFileSyncEnabled(projectId)
   return normalizeSourceWatchConfig({ enabled: legacyEnabled })
+}
+
+export async function saveSourceWatchAllProjects(enabled: boolean): Promise<void> {
+  const store = await getStore()
+  await store.set(SOURCE_WATCH_ALL_PROJECTS_KEY, enabled)
+  await store.save()
+}
+
+export async function loadSourceWatchAllProjects(): Promise<boolean> {
+  const store = await getStore()
+  return (await store.get<boolean>(SOURCE_WATCH_ALL_PROJECTS_KEY)) === true
 }
 
 // ── Update-check persistence ──────────────────────────────────────────────

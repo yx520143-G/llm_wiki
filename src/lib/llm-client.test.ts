@@ -130,6 +130,40 @@ describe("streamChat — buffered streaming responses", () => {
     expect(onDone).not.toHaveBeenCalled()
   })
 
+  it("retries a custom endpoint without temperature when the provider rejects it", async () => {
+    mockHttpFetch
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        error: { message: "Unsupported parameter: temperature" },
+      }), { status: 400 }))
+      .mockResolvedValueOnce(new Response([
+        openAiSseToken("retried"),
+        "data: [DONE]",
+      ].join("\n\n"), { status: 200 }))
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+      undefined,
+      { temperature: 0.1, max_tokens: 512 },
+    )
+
+    expect(mockHttpFetch).toHaveBeenCalledTimes(2)
+    expect(JSON.parse(String(mockHttpFetch.mock.calls[0][1]?.body))).toMatchObject({
+      temperature: 0.1,
+      max_tokens: 512,
+    })
+    const retryBody = JSON.parse(String(mockHttpFetch.mock.calls[1][1]?.body))
+    expect(retryBody.temperature).toBeUndefined()
+    expect(retryBody.max_tokens).toBe(512)
+    expect(onToken).toHaveBeenCalledWith("retried")
+    expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
   it("cancels a still-open response body after an SSE endpoint error", async () => {
     let bodyCancelled = false
     const body = new ReadableStream<Uint8Array>({
@@ -188,6 +222,109 @@ describe("streamChat — buffered streaming responses", () => {
 
     expect(onToken.mock.calls.map(([token]) => token)).toEqual(["Hello", " world"])
     expect(onDone).toHaveBeenCalledTimes(1)
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it("reports token-limit stream completion without discarding emitted content", async () => {
+    const body = [
+      openAiSseToken("partial analysis"),
+      `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "length" }] })}`,
+      "data: [DONE]",
+    ].join("\n\n")
+    mockHttpFetch.mockResolvedValue(new Response(body, {
+      status: 200,
+      headers: { "Content-Type": "text/event-stream" },
+    }))
+    const onToken = vi.fn()
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken, onDone, onError },
+    )
+
+    expect(onToken).toHaveBeenCalledWith("partial analysis")
+    expect(onDone).toHaveBeenCalledWith({ finishReason: "length", truncated: true })
+    expect(onError).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    [
+      "Anthropic",
+      'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}',
+      "max_tokens",
+    ],
+    [
+      "Gemini",
+      'data: {"candidates":[{"finishReason":"MAX_TOKENS"}]}',
+      "MAX_TOKENS",
+    ],
+  ])("reports %s token-limit completion", async (_provider, terminal, reason) => {
+    mockHttpFetch.mockResolvedValue(new Response([
+      openAiSseToken("partial"),
+      terminal,
+    ].join("\n\n"), { status: 200 }))
+    const onDone = vi.fn()
+
+    await streamChat(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError: vi.fn() },
+    )
+
+    expect(onDone).toHaveBeenCalledWith({ finishReason: reason, truncated: true })
+  })
+
+  it("reports a normal stop as complete", async () => {
+    mockHttpFetch.mockResolvedValue(new Response([
+      openAiSseToken("complete"),
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+      "data: [DONE]",
+    ].join("\n\n"), { status: 200 }))
+    const onDone = vi.fn()
+
+    await streamChat(
+      customStreamingCfg,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError: vi.fn() },
+    )
+
+    expect(onDone).toHaveBeenCalledWith({ finishReason: "stop", truncated: false })
+  })
+
+  it("reports token-limit completion for a non-streaming response", async () => {
+    const config = { ...customStreamingCfg, streamingEnabled: false }
+    mockHttpFetch.mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: "partial" }, finish_reason: "length" }],
+    }), { status: 200 }))
+    const onDone = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError: vi.fn() },
+    )
+
+    expect(onDone).toHaveBeenCalledWith({ finishReason: "length", truncated: true })
+  })
+
+  it("reports an empty token-limited non-streaming response as truncated", async () => {
+    const config = { ...customStreamingCfg, streamingEnabled: false }
+    mockHttpFetch.mockResolvedValue(new Response(JSON.stringify({
+      choices: [{ message: { content: "" }, finish_reason: "length" }],
+    }), { status: 200 }))
+    const onDone = vi.fn()
+    const onError = vi.fn()
+
+    await streamChat(
+      config,
+      [{ role: "user", content: "hi" }],
+      { onToken: vi.fn(), onDone, onError },
+    )
+
+    expect(onDone).toHaveBeenCalledWith({ finishReason: "length", truncated: true })
     expect(onError).not.toHaveBeenCalled()
   })
 

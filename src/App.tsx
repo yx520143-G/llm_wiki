@@ -9,20 +9,24 @@ import { useLintStore } from "@/stores/lint-store"
 import { useChatStore } from "@/stores/chat-store"
 import { BASE_FONT_SIZE_PX, useZoomStore } from "@/stores/zoom-store"
 import { openProject } from "@/commands/fs"
-import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMineruConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadCustomLlmPresets, loadActivePresetId, loadTaskModelRouting, loadProjectLlmOverride, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig, loadZoomLevel } from "@/lib/project-store"
+import { getLastProject, getRecentProjects, saveLastProject, loadLlmConfig, loadLanguage, loadSearchApiConfig, loadEmbeddingConfig, loadMineruConfig, loadMultimodalConfig, loadOutputLanguage, loadProviderConfigs, loadCustomLlmPresets, loadActivePresetId, loadTaskModelRouting, loadProjectLlmOverride, loadProxyConfig, loadScheduledImportConfig, saveScheduledImportConfig, loadSourceWatchAllProjects, loadSourceWatchConfig, loadApiConfig, loadGeneralConfig, loadZoomLevel } from "@/lib/project-store"
 import { loadReviewItems, loadLintItems, loadChatHistory, loadChatPreferences } from "@/lib/persist"
 import { setupAutoSave } from "@/lib/auto-save"
 import { startClipWatcher } from "@/lib/clip-watcher"
+import { DEFAULT_SOURCE_WATCH_CONFIG } from "@/lib/source-watch-config"
+import { useGlobalShortcut } from "@/hooks/use-global-shortcut"
 import { AppLayout } from "@/components/layout/app-layout"
 import { WelcomeScreen } from "@/components/project/welcome-screen"
 import { CreateProjectDialog } from "@/components/project/create-project-dialog"
 import type { WikiProject } from "@/types/wiki"
+import { useAppDialog } from "@/stores/app-dialog-store"
 
 function applyDocumentZoom(level: number) {
   document.documentElement.style.fontSize = `${BASE_FONT_SIZE_PX * level}px`
 }
 
 function App() {
+  const appDialog = useAppDialog()
   const project = useWikiStore((s) => s.project)
   const setProject = useWikiStore((s) => s.setProject)
   const setFileTree = useWikiStore((s) => s.setFileTree)
@@ -93,7 +97,14 @@ function App() {
 
   async function hydrateScheduledImportAfterOpen(proj: WikiProject): Promise<void> {
     try {
-      const savedScheduledImport = await loadScheduledImportConfig(proj.path)
+      let savedScheduledImport = null
+      try {
+        savedScheduledImport = await loadScheduledImportConfig(proj.path)
+      } catch (err) {
+        // A damaged config for the active project must not disable monitors
+        // belonging to every other recent project.
+        console.warn("[startup] failed to load current scheduled import config:", err)
+      }
       if (!isCurrentProject(proj)) return
       if (savedScheduledImport) {
         // Migrate relative path to absolute (backward compatibility)
@@ -105,15 +116,22 @@ function App() {
           ...savedScheduledImport,
           path,
         })
+      } else {
+        useWikiStore.getState().setScheduledImportConfig({
+          enabled: false,
+          path: "",
+          interval: 60,
+          lastScan: null,
+        })
       }
 
       const scheduledImportConfig = useWikiStore.getState().scheduledImportConfig
       if (!isCurrentProject(proj)) return
-      if (scheduledImportConfig.enabled && scheduledImportConfig.path && scheduledImportConfig.interval > 0) {
-        const { startScheduledImport } = await import("@/lib/scheduled-import")
-        if (!isCurrentProject(proj)) return
-        startScheduledImport(proj, scheduledImportConfig)
-      }
+      const { startScheduledImport } = await import("@/lib/scheduled-import")
+      if (!isCurrentProject(proj)) return
+      // Start the global sweep even when this project's own schedule is off;
+      // recently opened projects may still have active folder monitors.
+      startScheduledImport(proj, scheduledImportConfig)
     } catch (err) {
       console.warn("[startup] failed to hydrate scheduled import:", err)
     }
@@ -124,6 +142,15 @@ function App() {
     setupAutoSave()
     startClipWatcher()
   }, [])
+
+  // Register global keyboard shortcuts
+  // Cmd+, on macOS or Ctrl+, on Windows/Linux opens settings
+  useGlobalShortcut({
+    ",": {
+      callback: () => setActiveView("settings"),
+      allowInTextInput: true,
+    },
+  })
 
   useEffect(() => {
     // Apply interface zoom globally, including welcome/settings screens. We
@@ -428,8 +455,11 @@ function App() {
         projectLlmOverride,
         llmState.customLlmPresets,
       ))
-      const projectOutputLang = await loadOutputLanguage(proj.id)
-      useWikiStore.getState().setOutputLanguage(projectOutputLang ?? "auto")
+      const [projectOutputLang, globalOutputLang] = await Promise.all([
+        loadOutputLanguage(proj.id),
+        loadOutputLanguage(),
+      ])
+      useWikiStore.getState().setOutputLanguage(projectOutputLang ?? globalOutputLang ?? "auto")
       setSelectedFile(null)
       setFileTree([])
       setActiveView("wiki")
@@ -442,6 +472,21 @@ function App() {
       // Bump data version so any cached graphs/views invalidate
       useWikiStore.getState().bumpDataVersion()
       await saveLastProject(proj)
+
+      // Apply the project-specific worker limit before restoring its queue so
+      // newly enqueued tasks never start with another project's concurrency.
+      const { setIngestWorkerLimit } = await import("@/lib/ingest-queue")
+      try {
+        const config = await loadSourceWatchConfig(proj.id)
+        if (!isCurrentProject(proj)) return
+        useWikiStore.getState().setSourceWatchConfig(config)
+        setIngestWorkerLimit(config.ingestConcurrency)
+      } catch (err) {
+        console.error("Failed to load ingest concurrency:", err)
+        if (!isCurrentProject(proj)) return
+        useWikiStore.getState().setSourceWatchConfig(DEFAULT_SOURCE_WATCH_CONFIG)
+        setIngestWorkerLimit(DEFAULT_SOURCE_WATCH_CONFIG.ingestConcurrency)
+      }
 
       // Restore ingest queue (resume interrupted tasks). Keyed by the
       // project's stable UUID so the queue still finds the right project
@@ -461,16 +506,42 @@ function App() {
         )
       })
       // Start project source watch if enabled
-      import("@/lib/project-file-sync").then(async ({ startProjectFileSync, stopProjectFileSync }) => {
-        const config = await loadSourceWatchConfig(proj.id)
+      import("@/lib/project-file-sync").then(async ({
+        startAllProjectFileSync,
+        startProjectFileSync,
+        stopAllProjectFileSync,
+        stopProjectFileSync,
+      }) => {
+        const [configResult, allProjectsResult] = await Promise.allSettled([
+          loadSourceWatchConfig(proj.id),
+          loadSourceWatchAllProjects(),
+        ])
+        const config = configResult.status === "fulfilled"
+          ? configResult.value
+          : DEFAULT_SOURCE_WATCH_CONFIG
+        const allProjects = allProjectsResult.status === "fulfilled"
+          ? allProjectsResult.value
+          : false
+        if (configResult.status === "rejected") {
+          console.error("Failed to load project source watch config:", configResult.reason)
+        }
+        if (allProjectsResult.status === "rejected") {
+          console.error("Failed to load all-project source watch setting:", allProjectsResult.reason)
+        }
         if (!isCurrentProject(proj)) return
         useWikiStore.getState().setSourceWatchConfig(config)
+        useWikiStore.getState().setSourceWatchAllProjects(allProjects)
         if (config.enabled) {
           startProjectFileSync(proj, config).catch((err) =>
             console.error("Failed to start project file sync:", err)
           )
         } else {
           stopProjectFileSync().catch(() => {})
+        }
+        if (allProjects) {
+          startAllProjectFileSync(proj)
+        } else {
+          stopAllProjectFileSync()
         }
       }).catch((err) => console.error("Failed to configure project file sync:", err))
       // Notify local clip server of the current project + all recent projects
@@ -526,7 +597,7 @@ function App() {
       const validated = await openProject(proj.path)
       await handleProjectOpened(validated)
     } catch (err) {
-      window.alert(`Failed to open project: ${err}`)
+      await appDialog.alert({ message: `Failed to open project: ${err}` })
     }
   }
 
@@ -541,11 +612,14 @@ function App() {
       const proj = await openProject(selected)
       await handleProjectOpened(proj)
     } catch (err) {
-      window.alert(`Failed to open project: ${err}`)
+      await appDialog.alert({ message: `Failed to open project: ${err}` })
     }
   }
 
   async function handleSwitchProject() {
+    import("@/lib/project-file-sync").then(({ stopAllProjectFileSync }) => {
+      stopAllProjectFileSync()
+    }).catch(() => {})
     // Stop scheduled import before switching projects
     import("@/lib/scheduled-import").then(({ stopScheduledImport }) => {
       stopScheduledImport()

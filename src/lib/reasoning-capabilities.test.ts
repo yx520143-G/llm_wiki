@@ -20,6 +20,17 @@ describe("reasoning capabilities", () => {
     expect(normalizeReasoningForProvider(cfg, { mode: "off" })).toEqual({ mode: "auto" })
   })
 
+  it("offers OpenRouter's documented reasoning controls only on its endpoint", () => {
+    const cfg = {
+      ...config("custom", "vendor/reasoning-model"),
+      customEndpoint: "https://openrouter.ai/api/v1",
+    }
+
+    expect(resolveReasoningCapabilities(cfg).modes)
+      .toEqual(["auto", "off", "low", "medium", "high", "max", "custom"])
+    expect(normalizeReasoningForProvider(cfg, { mode: "low" })).toEqual({ mode: "low" })
+  })
+
   it("does not offer off for thinking-required Gemini and Claude models", () => {
     expect(resolveReasoningCapabilities(config("google", "gemini-2.5-pro")).modes)
       .not.toContain("off")
@@ -34,6 +45,13 @@ describe("reasoning capabilities", () => {
       .toEqual(["auto", "low", "medium", "high"])
     expect(normalizeReasoningForProvider(config("openai", "gpt-5.4"), { mode: "max" }))
       .toEqual({ mode: "auto" })
+  })
+
+  it("supports off and maximum effort for future OpenAI model families", () => {
+    expect(resolveReasoningCapabilities(config("openai", "gpt-6-luna")).modes)
+      .toEqual(["auto", "off", "low", "medium", "high", "max"])
+    expect(resolveReasoningCapabilities(config("openai", "gpt-4.1")).modes)
+      .toEqual(["auto"])
   })
 
   it("normalizes custom budgets to positive integer values", () => {

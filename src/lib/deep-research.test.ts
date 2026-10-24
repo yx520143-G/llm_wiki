@@ -1,9 +1,16 @@
 import { describe, expect, it, vi } from "vitest"
 import {
   citedResearchSourceIndexes,
+  addResearchTaskDiscriminator,
+  buildResearchPageContent,
   collectResearchSources,
+  filterResearchSourcesByRelevance,
   makeDeepResearchFileName,
+  makeAvailableResearchFilePath,
   noResearchSourcesTaskPatch,
+  rejectedResearchSourcesTaskPatch,
+  researchRelevanceRequestOverrides,
+  researchPageIdFromPath,
   resolveReviewForSavedResearch,
   validateResearchSynthesis,
 } from "./deep-research"
@@ -58,6 +65,77 @@ describe("makeDeepResearchFileName", () => {
   })
 })
 
+describe("buildResearchPageContent", () => {
+  it("normalizes path-prefixed page links without changing code or embeds", () => {
+    const content = buildResearchPageContent(
+      "AI research",
+      "2026-08-20",
+      [
+        "See [[concepts/adaptation|adaptation]] and [[entities/person#work]].",
+        "Keep `[[concepts/code-example]]` and ![[media/chart.png]].",
+      ].join("\n"),
+      "1. [Source](https://example.com)",
+    )
+
+    expect(content).toContain("[[adaptation|adaptation]]")
+    expect(content).toContain("[[person#work]]")
+    expect(content).toContain("`[[concepts/code-example]]`")
+    expect(content).toContain("![[media/chart.png]]")
+  })
+
+  it("normalizes malformed citation wikilinks before saving", () => {
+    const content = buildResearchPageContent(
+      "Topic",
+      "2026-09-27",
+      "Evidence [[1]] and combined [[2], [3], [4]].",
+      "1. [Source](https://example.test) — web",
+    )
+    expect(content).toContain("Evidence [1] and combined [2], [3], [4].")
+  })
+
+  it("keeps multiline topics inside one safe YAML scalar and heading", () => {
+    const content = buildResearchPageContent(
+      "first line\nsecond: \"quoted\"",
+      "2026-08-20",
+      "Substantive synthesis [1].",
+      "1. [Source](https://example.com)",
+    )
+    expect(content).toContain('title: "Research: first line second: \\"quoted\\""')
+    expect(content).toContain("# Research: first line second: \"quoted\"")
+    expect(content).not.toContain("first line\nsecond")
+  })
+})
+
+describe("makeAvailableResearchFilePath", () => {
+  it("adds a suffix instead of overwriting a same-second research result", async () => {
+    const existing = new Set([
+      "/project/wiki/queries/research-topic-2026-08-20-120000.md",
+      "/project/wiki/queries/research-topic-2026-08-20-120000-2.md",
+    ])
+    await expect(makeAvailableResearchFilePath(
+      "/project/wiki/queries",
+      "research-topic-2026-08-20-120000.md",
+      async (path) => existing.has(path),
+    )).resolves.toBe("/project/wiki/queries/research-topic-2026-08-20-120000-3.md")
+  })
+
+  it("gives concurrent tasks distinct readable filenames before existence checks", () => {
+    const fileName = "research-topic-2026-08-20-120000.md"
+    expect(addResearchTaskDiscriminator(fileName, "research-41"))
+      .toBe("research-topic-2026-08-20-120000-research-41.md")
+    expect(addResearchTaskDiscriminator(fileName, "research-42"))
+      .not.toBe(addResearchTaskDiscriminator(fileName, "research-41"))
+  })
+
+  it("derives the vector page id from the final collision-safe path", () => {
+    expect(researchPageIdFromPath(
+      "/project/wiki/queries/research-topic-2026-08-20-120000-research-41-2.md",
+    )).toBe("queries/research-topic-2026-08-20-120000-research-41-2")
+    expect(researchPageIdFromPath("C:\\project\\wiki\\queries\\research-topic-3.MD"))
+      .toBe("queries/research-topic-3")
+  })
+})
+
 describe("validateResearchSynthesis", () => {
   const substantiveChinese = [
     "解离是一类涉及记忆、身份、意识与环境感知连续性受扰的心理现象。[1]",
@@ -105,6 +183,16 @@ describe("noResearchSourcesTaskPatch", () => {
       status: "done",
       synthesis: "No research sources found.",
       error: null,
+    })
+  })
+})
+
+describe("rejectedResearchSourcesTaskPatch", () => {
+  it("reports rejected candidates and preserves source failures", () => {
+    expect(rejectedResearchSourcesTaskPatch(2, ["Web provider timed out"])).toEqual({
+      status: "error",
+      synthesis: "",
+      error: "2 candidate source(s) were found, but all were rejected by the relevance and evidence-quality gate. Refine the research topic or queries and retry.\nWeb provider timed out",
     })
   })
 })
@@ -363,5 +451,171 @@ describe("collectResearchSources", () => {
     expect(out.results).toHaveLength(20)
     expect(infoSpy).toHaveBeenCalledTimes(1)
     infoSpy.mockRestore()
+  })
+
+  it("applies the relevance filter after deduplication and capping", async () => {
+    const lowQuality = {
+      title: "Unrelated homework answers",
+      url: "https://documents.test/homework",
+      snippet: "Exam answers unrelated to the research topic",
+      source: "documents.test",
+    }
+    const relevanceFilter = vi.fn().mockImplementation(async (_queries, results) => [results[0]])
+    const webSearch = vi.fn().mockResolvedValue([webResult, lowQuality])
+    const anyTxtSearch = vi.fn().mockResolvedValue([])
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({ deepResearchSource: "web", provider: "tavily", apiKey: "tvly" }),
+      "/project",
+      { webSearch, anyTxtSearch },
+      { llmConfig: {} as never, researchTopic: "Alpha topic", relevanceFilter },
+    )
+
+    expect(relevanceFilter).toHaveBeenCalledWith(
+      ["alpha"],
+      [webResult, lowQuality],
+      expect.anything(),
+      "Alpha topic",
+    )
+    expect(out.results).toEqual([webResult])
+    expect(out.candidateCount).toBe(2)
+    expect(out.rejectedCount).toBe(1)
+  })
+})
+
+describe("filterResearchSourcesByRelevance", () => {
+  it("uses a bounded non-reasoning request for the quality gate", () => {
+    const overrides = researchRelevanceRequestOverrides()
+
+    expect(overrides).toMatchObject({
+      temperature: 0,
+      max_tokens: 512,
+      reasoning: { mode: "off" },
+    })
+  })
+
+  it("keeps only indexes approved by the quality judge", async () => {
+    const noisy: WebSearchResult = {
+      title: "Courseware and exam answers",
+      url: "https://documents.test/exam",
+      snippet: "Unrelated homework material",
+      source: "documents.test",
+    }
+    const judge = vi.fn().mockResolvedValue("{\"keep\":[1]}")
+
+    const filtered = await filterResearchSourcesByRelevance(
+      ["alpha project mechanism"],
+      [webResult, noisy],
+      {} as never,
+      "Alpha project mechanism",
+      judge,
+    )
+
+    expect(filtered).toEqual([webResult])
+    const messages = judge.mock.calls[0][1]
+    expect(messages[0].content).toContain("document-sharing farms")
+    expect(messages[0].content).toContain("unrelated meanings of ambiguous terms")
+    expect(messages[0].content).toContain("contradictory evidence")
+    expect(JSON.parse(messages[1].content).researchTopic).toBe("Alpha project mechanism")
+  })
+
+  it("fails open when the quality judge response is malformed", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const results = [webResult]
+    const filtered = await filterResearchSourcesByRelevance(
+      ["alpha"],
+      results,
+      {} as never,
+      "Alpha",
+      vi.fn().mockResolvedValue("not json"),
+    )
+    expect(filtered).toEqual(results)
+    expect(warn).toHaveBeenCalled()
+    warn.mockRestore()
+  })
+
+  it("allows the judge to reject every irrelevant candidate", async () => {
+    const filtered = await filterResearchSourcesByRelevance(
+      ["alpha"],
+      [webResult],
+      {} as never,
+      "Alpha",
+      vi.fn().mockResolvedValue("```json\n{\"keep\":[]}\n```"),
+    )
+    expect(filtered).toEqual([])
+  })
+
+  it("accepts numeric string indexes and fails open on zero-based output", async () => {
+    const second = { ...webResult, title: "Second", url: "https://example.com/second" }
+    await expect(filterResearchSourcesByRelevance(
+      ["alpha"],
+      [webResult, second],
+      {} as never,
+      "Alpha",
+      vi.fn().mockResolvedValue("{\"keep\":[\"1\"]}"),
+    )).resolves.toEqual([webResult])
+    await expect(filterResearchSourcesByRelevance(
+      ["alpha"],
+      [webResult, second],
+      {} as never,
+      "Alpha",
+      vi.fn().mockResolvedValue("{\"keep\":[0]}"),
+    )).resolves.toEqual([webResult, second])
+  })
+
+  it("fails open when non-empty indexes contain no valid candidate", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {})
+    const filtered = await filterResearchSourcesByRelevance(
+      ["alpha"],
+      [webResult],
+      {} as never,
+      "Alpha",
+      vi.fn().mockResolvedValue("{\"keep\":[99]}"),
+    )
+    expect(filtered).toEqual([webResult])
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("relevance gate failed"),
+      expect.anything(),
+    )
+    warn.mockRestore()
+  })
+
+  it("parses the last compact keep object around prose and reasoning", async () => {
+    const second = { ...webResult, title: "Second", url: "https://example.com/second" }
+    const filtered = await filterResearchSourcesByRelevance(
+      ["alpha"],
+      [webResult, second],
+      {} as never,
+      "Alpha",
+      vi.fn().mockResolvedValue("<think>{draft}</think>Result: {\"keep\":[2]} done"),
+    )
+    expect(filtered).toEqual([second])
+  })
+})
+
+describe("collectResearchSources relevance origins", () => {
+  it("filters web candidates but always preserves local AnyTXT results", async () => {
+    const webSearch = vi.fn().mockResolvedValue([webResult])
+    const anyTxtSearch = vi.fn().mockResolvedValue([localResult])
+    const relevanceFilter = vi.fn().mockResolvedValue([])
+
+    const out = await collectResearchSources(
+      ["alpha"],
+      config({
+        deepResearchSource: "both",
+        provider: "tavily",
+        apiKey: "tvly",
+        anyTxt: { endpoint: "http://127.0.0.1:9920" },
+      }),
+      "/project",
+      { webSearch, anyTxtSearch },
+      { llmConfig: {} as never, researchTopic: "Alpha", relevanceFilter },
+    )
+
+    expect(relevanceFilter).toHaveBeenCalledWith(["alpha"], [webResult], expect.anything(), "Alpha")
+    expect(out.results).toEqual([localResult])
+    expect(out.candidateCount).toBe(2)
+    expect(out.rejectedCount).toBe(1)
   })
 })
